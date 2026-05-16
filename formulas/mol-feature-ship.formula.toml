@@ -246,17 +246,90 @@ run_gate() {
 }
 ```
 
-### Build
+### Package manager runtime detection
+
+If `package.json` exists, pick the script runtime: bun if `bun.lock` or
+`bun.lockb` is present, otherwise npm. The runtime affects how
+package.json scripts are invoked and what fallback test runner is
+available. Bun handles its own dependency materialization, so we do not
+gate on `node_modules/` being present.
+
+```bash
+PKG_RUNNER=""
+if [ -f package.json ]; then
+    if [ -f bun.lock ] || [ -f bun.lockb ]; then
+        PKG_RUNNER="bun"
+    else
+        PKG_RUNNER="npm"
+    fi
+fi
+```
+
+### Helpers for package.json gates
+
+`pick_script` returns the first matching script name from a candidate
+list. It uses `jq --arg` so script names with colons (`test:unit`,
+`lint:check`, etc.) resolve correctly. `run_pkg_script` dispatches the
+chosen script through the detected runtime. The gate name passed to
+`run_pkg_script` describes the gate *purpose* (build / lint / test /
+verify), not the underlying script, so failure summaries stay readable.
+
+```bash
+pick_script() {
+    [ -f package.json ] || return 1
+    for s in "$@"; do
+        if [ "$(jq -r --arg s "$s" '.scripts[$s] // ""' package.json 2>/dev/null)" != "" ]; then
+            echo "$s"
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_pkg_script() {
+    local gate="$1" script="$2"
+    if [ "$PKG_RUNNER" = "bun" ]; then
+        run_gate "$gate" bun run "$script"
+    else
+        run_gate "$gate" npm run "$script"
+    fi
+}
+```
+
+For each gate purpose we also record what was detected (and what
+actually ran) so the end-of-step summary can explain a `no_gates_ran`
+block by showing the witness which scripts were considered.
+
+```bash
+GATE_DETAIL=""
+record_detail() {
+    GATE_DETAIL="${GATE_DETAIL}${GATE_DETAIL:+; }$*"
+}
+```
+
+### Build / typecheck
+
+`typecheck`, `tsc`, `check`, and `compile` all count as the build gate
+for repos that use TypeScript-style type checking instead of an explicit
+build step. The order below picks the most explicit candidate first.
 
 ```bash
 if [ -f Makefile ] && grep -q "^build:" Makefile; then
     run_gate build make build
+    record_detail "build=make"
 elif [ -f go.mod ]; then
     run_gate build go build ./...
-elif [ -f package.json ] && [ "$(jq -r '.scripts.build // ""' package.json 2>/dev/null)" != "" ]; then
-    run_gate build npm run build
+    record_detail "build=go"
+elif [ -f package.json ]; then
+    if BUILD_SCRIPT=$(pick_script typecheck tsc check compile build); then
+        run_pkg_script build "$BUILD_SCRIPT"
+        record_detail "build=$PKG_RUNNER:$BUILD_SCRIPT"
+    else
+        record_detail "build=none"
+    fi
 elif [ -f Cargo.toml ]; then
     run_gate build cargo build
+    record_detail "build=cargo"
 fi
 ```
 
@@ -265,28 +338,68 @@ fi
 ```bash
 if [ -f Makefile ] && grep -q "^lint:" Makefile; then
     run_gate lint make lint
+    record_detail "lint=make"
 elif [ -f go.mod ]; then
     run_gate vet go vet ./...
-elif [ -f package.json ] && [ "$(jq -r '.scripts.lint // ""' package.json 2>/dev/null)" != "" ]; then
-    run_gate lint npm run lint
+    record_detail "lint=go-vet"
+elif [ -f package.json ]; then
+    if LINT_SCRIPT=$(pick_script lint lint:check eslint prettier:check format:check); then
+        run_pkg_script lint "$LINT_SCRIPT"
+        record_detail "lint=$PKG_RUNNER:$LINT_SCRIPT"
+    else
+        record_detail "lint=none"
+    fi
 elif [ -f Cargo.toml ]; then
     run_gate clippy cargo clippy
+    record_detail "lint=clippy"
 fi
 ```
 
 ### Tests
 
+If no package.json test script matches but bun is the detected runtime,
+fall back to `bun test` — bun ships a builtin test runner, so a repo
+that uses it doesn't need a `"test"` script.
+
 ```bash
 if [ -f Makefile ] && grep -q "^test:" Makefile; then
     run_gate test make test
+    record_detail "test=make"
 elif [ -f go.mod ]; then
     run_gate test go test ./...
-elif [ -f package.json ] && [ "$(jq -r '.scripts.test // ""' package.json 2>/dev/null)" != "" ]; then
-    run_gate test npm test
+    record_detail "test=go"
+elif [ -f package.json ]; then
+    if TEST_SCRIPT=$(pick_script test test:unit test:ci jest vitest); then
+        run_pkg_script test "$TEST_SCRIPT"
+        record_detail "test=$PKG_RUNNER:$TEST_SCRIPT"
+    elif [ "$PKG_RUNNER" = "bun" ]; then
+        run_gate test bun test
+        record_detail "test=bun-builtin"
+    else
+        record_detail "test=none"
+    fi
 elif [ -f Cargo.toml ]; then
     run_gate test cargo test
+    record_detail "test=cargo"
 elif [ -f pyproject.toml ]; then
     run_gate test pytest
+    record_detail "test=pytest"
+fi
+```
+
+### Verify (optional package.json meta-gate)
+
+Some repos define a single `verify` / `ci` / `validate` script that
+chains build / lint / test internally. If one exists, run it as an
+independent gate — it counts toward "at least one gate ran" but does
+not replace the per-purpose gates above.
+
+```bash
+if [ -f package.json ]; then
+    if VERIFY_SCRIPT=$(pick_script verify ci validate); then
+        run_pkg_script verify "$VERIFY_SCRIPT"
+        record_detail "verify=$PKG_RUNNER:$VERIFY_SCRIPT"
+    fi
 fi
 ```
 
@@ -310,22 +423,30 @@ fi
 
 State is written via `--set-metadata` because the route step needs to read
 it after this step's notes block may have been overwritten by other
-updates. The `--append-notes` line adds a human-readable breadcrumb.
+updates. The `--append-notes` line adds a human-readable breadcrumb. The
+`ship_gates_detail` value records which signals were considered (and
+which actually ran), so users debugging a `no_gates_ran` block can see
+exactly what the formula looked for on this repo.
 
 ```bash
 bd update "$ROOT_ID" \\
     --set-metadata ship_gates_passed="$GATES_PASSED" \\
     --set-metadata ship_gates_failed="$GATES_FAILED" \\
     --set-metadata ship_result_dir="$RESULT_DIR" \\
+    --set-metadata ship_gates_detail="$GATE_DETAIL" \\
     --append-notes "feature-ship: gates ran
   passed:$GATES_PASSED
   failed:$GATES_FAILED
+  detail: $GATE_DETAIL
   result_dir: $RESULT_DIR"
+
+echo "[feature-ship] mechanical-gates summary: ${GATE_DETAIL:-no signals detected}"
 ```
 
 **Exit criteria:** Every applicable gate has been run exactly once. Pass /
 fail status is recorded in metadata `ship_gates_passed` / `ship_gates_failed`.
-Per-gate logs live in `$RESULT_DIR` and the path is recorded on the bead
+The detected/run signals are recorded in `ship_gates_detail`. Per-gate
+logs live in `$RESULT_DIR` and the path is recorded on the bead
 for the route step.
 """
 
@@ -348,6 +469,7 @@ ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
 META=$(bd show "$ROOT_ID" --json | jq -c '.[0].metadata')
 GATES_PASSED=$(echo "$META" | jq -r '.ship_gates_passed // ""')
 GATES_FAILED=$(echo "$META" | jq -r '.ship_gates_failed // ""')
+GATES_DETAIL=$(echo "$META" | jq -r '.ship_gates_detail // ""')
 RESULT_DIR=$(echo "$META" | jq -r '.ship_result_dir // ""')
 WITNESS_TARGET=$(echo "$META" | jq -r '.ship_witness_target // ""')
 PR_URL=$(echo "$META" | jq -r '.ship_pr_url // ""')
@@ -400,26 +522,42 @@ whether the PR was concurrently modified."
 fi
 
 if [ -z "$GF_TRIMMED" ] && [ -z "$GP_TRIMMED" ]; then
-    # No gates ran at all — the language / build signals we look for are
-    # absent. Treat as a configuration problem and escalate to witness.
+    # No gates ran at all — none of the candidate signals matched.
+    # Treat as a configuration problem and escalate to witness with the
+    # detection detail so the human sees exactly which signals were tried.
     bd update "$ROOT_ID" \\
         --set-metadata gc.routed_to="$WITNESS_TARGET" \\
         --set-metadata ship_status=blocked \\
         --set-metadata ship_gate=no_gates_ran \\
-        --append-notes "feature-ship: BLOCKED — mechanical-gates step ran no checks. No language or build signal detected on integration branch."
+        --append-notes "feature-ship: BLOCKED — mechanical-gates step ran no checks.
+  detection_detail: ${GATES_DETAIL:-none}"
     gc mail send "$WITNESS_TARGET" \\
         -s "SHIP FAILED: no mechanical gates ran for PR #{{pr}}" \\
-        -m "mol-feature-ship found no Makefile, go.mod, package.json,
-Cargo.toml, or pyproject.toml signal on integration branch
-{{integration_branch}}. The formula refused to mark the PR ready-for-review
-without at least one passing gate.
+        -m "mol-feature-ship found no recognized build/lint/test signal on
+integration branch {{integration_branch}}. The formula refused to mark the
+PR ready-for-review without at least one passing gate.
+
+Detection detail: ${GATES_DETAIL:-no signals detected}
+
+The formula recognizes:
+  - Makefile targets: build, lint, test, check-docs, docs
+  - Go: go.mod (build / vet / test)
+  - package.json scripts (npm or bun runtime):
+      build:   typecheck, tsc, check, compile, build
+      lint:    lint, lint:check, eslint, prettier:check, format:check
+      test:    test, test:unit, test:ci, jest, vitest (or bun test builtin)
+      verify:  verify, ci, validate
+  - Rust: Cargo.toml (build / clippy / test)
+  - Python: pyproject.toml (pytest)
 
 Integration branch: {{integration_branch}}
 PR URL: $PR_URL
 
-Either extend mol-feature-ship to support this repo's build system, or
-mark the PR ready-for-review manually after the appropriate manual checks."
+Either extend mol-feature-ship to support this repo's build system, add a
+matching script in package.json, or mark the PR ready-for-review manually
+after the appropriate manual checks."
     echo "[feature-ship] BLOCKED — no gates ran. Witness mailed."
+    echo "[feature-ship]   detection_detail: ${GATES_DETAIL:-none}"
     exit 1
 fi
 ```
