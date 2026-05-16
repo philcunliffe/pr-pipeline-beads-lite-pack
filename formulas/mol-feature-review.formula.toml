@@ -1,0 +1,410 @@
+description = """
+Feature-review wrapper around `mol-pr-review` for the integration-branch
+flow. Runs the 11-category outgoing-PR scorecard against the draft PR
+that fronts an integration branch, reads the verdict the sub-formula
+records, and either marks the review approved or files a rollup fix
+bead against the integration branch.
+
+A coding agent (polecat or equivalent) runs this when a review bead is
+dispatched, either manually or by the gastown-beads-lite refinery's
+post-merge auto-routing (gb-RTR). The formula composes the existing
+outgoing-PR self-review and routes on its verdict — it does not
+re-implement the scorecard.
+
+## Beads-Lite Command Note
+
+In gastown-beads-lite rig sessions, translate the `bd ...` examples below to:
+
+```bash
+BEADS_DIR=<rig-root>/.beads gc gastown-beads-lite bd ...
+```
+
+Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
+
+## Metadata convention
+
+The metadata fields this formula reads (`target`, `feature_phase`) and
+writes (`target`, `feature_phase=fix`, `merge_strategy=integration`,
+`gc.routed_to`, `pr`, `source_review_bead`) follow the foundation bead
+(`gb-FND` in `gastown-beads-lite-pack`). The formula does not define
+the convention — it consumes it.
+
+## Contract
+
+1. Caller slings with `--var pr=<draft-PR-number>` and
+   `--var integration_branch=<branch-name>`
+2. Agent works through 4 sequential steps
+3. Sub-formula `mol-pr-review` runs against the draft PR; its report is
+   written to `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>.md`
+4. Verdict (`approve` | `request_changes` | `block`) is read from the
+   sub-formula bead's notes
+5. On `approve`: root bead notes record `verdict: approve` and
+   `status: complete`. The refinery's post-merge routing files the
+   subsequent ship bead.
+6. On `block` / `request_changes`: a rollup fix bead is filed against
+   the integration branch with the full metadata convention.
+
+## Failure Modes
+
+| Situation | Action |
+|-----------|--------|
+| PR does not exist or is not draft | Failure path: witness mail, blocked |
+| Headref does not match integration_branch | Failure path: witness mail, blocked |
+| Sub-formula crashes | Failure path: witness mail, blocked |
+| Verdict cannot be parsed from sub-formula notes | Failure path: witness mail, blocked |"""
+formula = "mol-feature-review"
+version = 1
+
+[vars]
+[vars.pr]
+description = "Draft PR number of the integration branch (bare integer in current repo)"
+required = true
+
+[vars.integration_branch]
+description = "Integration branch name. Used for routing context and the rollup fix bead's metadata.target."
+required = true
+
+[[steps]]
+id = "intake"
+title = "Confirm PR is draft and matches integration_branch"
+description = """
+Resolve the root bead, confirm metadata convention, and verify the
+draft PR matches the integration branch.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Not in a git repository — cannot review feature."
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: not a git checkout"
+    exit 1
+}
+cd "$REPO_ROOT"
+```
+
+Confirm the bead is the right shape:
+
+```bash
+TARGET=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.target // ""')
+PHASE=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.feature_phase // ""')
+if [ "$TARGET" != "{{integration_branch}}" ]; then
+    echo "metadata.target ($TARGET) does not match integration_branch ({{integration_branch}})"
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: target/integration_branch mismatch ($TARGET vs {{integration_branch}})"
+    exit 1
+fi
+if [ "$PHASE" != "review" ]; then
+    echo "metadata.feature_phase ($PHASE) is not 'review'"
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: feature_phase is '$PHASE', expected 'review'"
+    exit 1
+fi
+```
+
+Confirm PR exists and is in draft state with the right headref:
+
+```bash
+PR_JSON=$(gh pr view {{pr}} --json state,isDraft,headRefName 2>/dev/null) || {
+    echo "PR #{{pr}} not found"
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: gh pr view {{pr}} failed"
+    exit 1
+}
+IS_DRAFT=$(echo "$PR_JSON" | jq -r '.isDraft')
+HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
+if [ "$IS_DRAFT" != "true" ]; then
+    echo "PR #{{pr}} is not draft (isDraft=$IS_DRAFT, state=$PR_STATE)"
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: PR #{{pr}} not draft (state=$PR_STATE)"
+    exit 1
+fi
+if [ "$HEAD_REF" != "{{integration_branch}}" ]; then
+    echo "PR #{{pr}} headRef ($HEAD_REF) does not match integration_branch ({{integration_branch}})"
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: PR headRef ($HEAD_REF) != integration_branch ({{integration_branch}})"
+    exit 1
+fi
+```
+
+Record initial state:
+
+```bash
+bd update "$ROOT_ID" --notes "pr: {{pr}}
+integration_branch: {{integration_branch}}
+pr_state: $PR_STATE
+status: in_progress"
+```
+
+**Exit criteria:** PR exists, is draft, headRef matches
+integration_branch, metadata confirmed; initial state recorded.
+
+If any check fails: jump to the failure path described in `route`.
+"""
+
+[[steps]]
+id = "run-review"
+title = "Compose mol-pr-review against the draft PR"
+description = """
+Run the existing outgoing-PR self-review against PR `{{pr}}`. The
+sub-formula writes its scorecard report to
+`${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}.md` and records its
+verdict (`approve` | `request_changes` | `block`) in the sub-formula
+bead's notes.
+
+Prefer composition via sub-sling. The shape of the call depends on the
+caller environment; the canonical form is:
+
+```bash
+gc <rig>/pr-pipeline pr review {{pr}}
+```
+
+…or, equivalently, slinging the formula directly:
+
+```bash
+gc <rig>/pr-pipeline sling mol-pr-review --formula --var pr={{pr}}
+```
+
+Use whichever wrapper the rig exposes. Capture the sub-formula's bead
+ID for the verdict read:
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+# Capture sub-sling output; the wrapper prints the sub-bead ID.
+SUB_OUT=$(gc <rig>/pr-pipeline pr review {{pr}} 2>&1)
+SUB_BEAD=$(echo "$SUB_OUT" | grep -oE 'prblp-[a-z0-9]+' | tail -1)
+if [ -z "$SUB_BEAD" ]; then
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: could not capture sub-bead from mol-pr-review"
+    # jump to failure path in `route`
+    exit 1
+fi
+bd update "$ROOT_ID" --notes "sub_review_bead: $SUB_BEAD"
+```
+
+If sub-slinging is not supported in the current pack infrastructure,
+inline the review logic by following `mol-pr-review`'s four steps
+directly (intake → scorecard → recurring-themes → produce-report).
+Write the report to the same `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}.md`
+path so the rest of this formula reads from a stable location. When
+inlining, record the verdict on the root bead's notes instead (skip
+the `SUB_BEAD` capture).
+
+Compute and remember the report path:
+
+```bash
+if [ -n "${GC_CITY_PATH:-}" ]; then
+    REPORT_PATH="${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}.md"
+else
+    REPORT_PATH=".gc/pr-pipeline/reviews/pr-{{pr}}.md"
+fi
+bd update "$ROOT_ID" --notes "review_report: $REPORT_PATH"
+```
+
+**Exit criteria:** Sub-formula has run (or inline scorecard has
+completed), report file exists at the expected path, sub-bead ID (or
+verdict, if inlined) is recorded on the root bead.
+
+If the sub-sling crashes: jump to the failure path in `route`.
+"""
+needs = ["intake"]
+
+[[steps]]
+id = "read-verdict"
+title = "Extract verdict from sub-formula notes"
+description = """
+The sub-formula records `verdict:` in its notes — one of `approve`,
+`request_changes`, or `block`. Read it:
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+SUB_BEAD=$(echo "$NOTES" | grep -m1 '^sub_review_bead:' | sed 's/^sub_review_bead: //')
+
+if [ -n "$SUB_BEAD" ]; then
+    # Sub-sling path: verdict is on the sub-bead.
+    VERDICT=$(bd show "$SUB_BEAD" --json | jq -r '.[0].notes // ""' \\
+        | grep -m1 '^verdict:' | sed 's/^verdict: //')
+else
+    # Inline path: verdict is on the root bead's own notes.
+    VERDICT=$(echo "$NOTES" | grep -m1 '^verdict:' | sed 's/^verdict: //')
+fi
+
+case "$VERDICT" in
+    approve|request_changes|block) ;;
+    *)
+        bd update "$ROOT_ID" --notes "status: blocked
+failure: could not parse verdict from review (saw: '$VERDICT')"
+        # jump to failure path in `route`
+        exit 1
+        ;;
+esac
+
+bd update "$ROOT_ID" --notes "verdict: $VERDICT"
+```
+
+**Exit criteria:** `verdict` is one of {approve, request_changes,
+block} and recorded on the root bead's notes.
+"""
+needs = ["run-review"]
+
+[[steps]]
+id = "route"
+title = "Approve, or file a rollup fix bead"
+description = """
+Branch on the verdict. On `approve`, mark complete and exit — the
+refinery's post-merge routing (gb-RTR) will pick up from there. On
+`block` or `request_changes`, file a rollup fix bead against the
+integration branch with the full metadata convention.
+
+Read state:
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+VERDICT=$(echo "$NOTES" | grep -m1 '^verdict:' | sed 's/^verdict: //')
+REPORT_PATH=$(echo "$NOTES" | grep -m1 '^review_report:' | sed 's/^review_report: //')
+RIG="${GC_RIG:-<rig>}"
+```
+
+### Approve path
+
+```bash
+if [ "$VERDICT" = "approve" ]; then
+    bd update "$ROOT_ID" --notes "verdict: approve
+review_report: $REPORT_PATH
+status: complete"
+    echo "[feature-review] APPROVED — refinery will route ship bead."
+    echo "[feature-review]   Integration branch: {{integration_branch}}"
+    echo "[feature-review]   PR #{{pr}}"
+    echo "[feature-review]   Report: $REPORT_PATH"
+    exit 0
+fi
+```
+
+### Request-changes / block path
+
+File a rollup fix bead. Per spec v1, dump the full review report into
+the fix bead body under "Findings to address" — the fix polecat re-reads
+the structured report directly. Don't try to parse findings out of the
+report; cleanliness can come later.
+
+```bash
+if [ "$VERDICT" = "request_changes" ] || [ "$VERDICT" = "block" ]; then
+    FIX_TITLE="Fix review findings: {{integration_branch}}"
+
+    if [ -f "$REPORT_PATH" ]; then
+        REPORT_BODY=$(cat "$REPORT_PATH")
+    else
+        REPORT_BODY="(report file not found at $REPORT_PATH — see sub-formula bead notes)"
+    fi
+
+    FIX_BODY=$(cat <<EOM
+# Fix review findings for {{integration_branch}}
+
+The outgoing-PR review (PR #{{pr}}) returned verdict: $VERDICT.
+
+## Review report
+
+Full report path: $REPORT_PATH
+
+## Findings to address
+
+The structured scorecard below is reproduced verbatim from the report.
+Address every blocker and major finding. Minors may be addressed at
+your discretion; document any minor you intentionally defer in the
+commit messages.
+
+$REPORT_BODY
+
+## Workflow
+
+- Branch off origin/{{integration_branch}} (the polecat formula handles
+  this via metadata.target / metadata.merge_strategy).
+- Address all findings recorded above.
+- Push to your polecat branch.
+- Refinery rebases + merges into {{integration_branch}}.
+- Refinery's post-merge routing detects this fix's last-merge and files
+  the ship bead automatically. **No re-review will run.**
+EOM
+)
+
+    # Create the fix bead. Use a temp file for the body so newlines and
+    # embedded markdown survive shell quoting.
+    FIX_BODY_FILE=$(mktemp -t fix-body.XXXXXX.md)
+    printf '%s\\n' "$FIX_BODY" > "$FIX_BODY_FILE"
+    FIX_ID=$(bd create "$FIX_TITLE" --description-file "$FIX_BODY_FILE" --json | jq -r '.id // .[0].id')
+    rm -f "$FIX_BODY_FILE"
+
+    if [ -z "$FIX_ID" ] || [ "$FIX_ID" = "null" ]; then
+        bd update "$ROOT_ID" --notes "status: blocked
+failure: bd create returned no id for fix bead"
+        # fall through to failure path below
+    else
+        bd update "$FIX_ID" \\
+            --set-metadata target={{integration_branch}} \\
+            --set-metadata feature_phase=fix \\
+            --set-metadata merge_strategy=integration \\
+            --set-metadata gc.routed_to=$RIG/gastown-beads-lite.polecat \\
+            --set-metadata pr={{pr}} \\
+            --set-metadata source_review_bead=$ROOT_ID
+
+        # Graph hygiene: the fix is blocked-by the review.
+        bd dep add "$FIX_ID" --blocked-by "$ROOT_ID" || true
+
+        bd update "$ROOT_ID" --notes "verdict: $VERDICT
+review_report: $REPORT_PATH
+fix_bead_id: $FIX_ID
+status: complete"
+
+        echo "[feature-review] $VERDICT — filed fix bead $FIX_ID"
+        echo "[feature-review]   Integration branch: {{integration_branch}}"
+        echo "[feature-review]   PR #{{pr}}"
+        echo "[feature-review]   Report: $REPORT_PATH"
+        echo "[feature-review]   Routed to: $RIG/gastown-beads-lite.polecat"
+        exit 0
+    fi
+fi
+```
+
+### Failure path
+
+Reached if any prior step recorded `status: blocked` and jumped here,
+or if the fix-bead creation above failed. Mark the bead routed to the
+witness, then mail.
+
+```bash
+# Re-read status — if a prior step set status: blocked, honor it.
+STATUS=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' \\
+    | grep -m1 '^status:' | sed 's/^status: //')
+FAILURE=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""' \\
+    | grep -m1 '^failure:' | sed 's/^failure: //')
+
+if [ "$STATUS" = "blocked" ] || [ -z "$VERDICT" ]; then
+    SUMMARY="${FAILURE:-unknown failure}"
+    bd update "$ROOT_ID" \\
+        --set-metadata gc.routed_to=$RIG/gastown-beads-lite.witness \\
+        --notes "status: blocked
+failure: $SUMMARY"
+
+    gc mail send "$RIG/gastown-beads-lite.witness" \\
+        -s "REVIEW FAILED: $ROOT_ID" \\
+        -m "Feature review for {{integration_branch}} (PR #{{pr}}) failed: $SUMMARY. Bead: $ROOT_ID."
+
+    echo "[feature-review] FAILED — witness mailed. Human triage required."
+    echo "[feature-review]   Bead: $ROOT_ID"
+    echo "[feature-review]   Reason: $SUMMARY"
+    exit 1
+fi
+```
+
+**Exit criteria:**
+- `approve` → bead notes record verdict + status complete; no fix bead.
+- `request_changes` / `block` → rollup fix bead exists with
+  `target`, `feature_phase=fix`, `merge_strategy=integration`,
+  `gc.routed_to=<rig>/gastown-beads-lite.polecat`, `pr`,
+  `source_review_bead`; dep edge fix blocked-by review; root bead
+  records verdict + fix_bead_id + status complete.
+- Failure → bead routed to witness; mail sent; bead marked blocked.
+"""
+needs = ["read-verdict"]
