@@ -1,0 +1,499 @@
+description = """
+Feature ship gate — mechanical checks for an integration branch's draft PR,
+followed by a human-only hand-off.
+
+Runs build / vet / lint / test / docs against the integration branch. On
+all-green: marks the draft PR ready-for-review via `gh pr ready`. On any
+red: mails the rig witness with a truncated failure summary and marks the
+root bead blocked. **No auto-merge** — the `gh pr ready` call is the single
+hand-off point to the human. After that, GitHub's normal review/merge flow
+takes over.
+
+This formula reuses the mechanical-gates concept from `mol-pr-ship`'s
+contributor-check stage but deliberately skips simplify and review-iterate:
+those run during feature development, not at ship-time.
+
+## Beads-Lite Command Note
+
+In gastown-beads-lite rig sessions, translate the `bd ...` examples below to:
+
+```bash
+BEADS_DIR=<rig-root>/.beads gc gastown-beads-lite bd ...
+```
+
+Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
+
+## Contract
+
+1. Caller slings with `--var pr=<N> --var integration_branch=<name>`.
+2. Agent verifies the PR exists and is in draft state, fetches and checks
+   out the integration branch.
+3. Agent runs every applicable mechanical gate (does NOT short-circuit on
+   the first failure — the failure summary needs to be complete).
+4. On all-green: `gh pr ready <pr>`; metadata `ship_status=complete` and
+   `ship_pr_status=ready_for_review`; the root bead is closed.
+5. On any red: witness mail sent with truncated per-gate logs; metadata
+   `ship_status=blocked` and `gc.routed_to` set to the rig witness so the
+   witness session can pick the bead up.
+6. **Do NOT auto-file a fix bead.** Gate failures here are usually
+   environmental (CI flake, missing tool, build infra) and need human
+   judgment — auto-firing a polecat would just chase its tail.
+
+Cross-step state lives in metadata under `ship_*` keys, not notes, because
+`bd update --notes` replaces the notes block rather than appending. The
+running `--append-notes` log is for humans; the route step reads metadata
+to make its decision.
+
+## Failure Modes
+
+| Situation                          | Action                                                 |
+|------------------------------------|--------------------------------------------------------|
+| PR not found                       | Mark bead blocked; mail witness; route to witness.     |
+| PR not in draft state              | Mark bead blocked; mail witness; route to witness.     |
+| Integration branch unfetchable     | Mark bead blocked; mail witness; route to witness.     |
+| Any mechanical gate fails          | Mark bead blocked; mail witness with logs; route.      |
+| All gates pass, `gh pr ready` fails| Mark bead blocked; mail witness; route to witness.     |
+| All gates pass, `gh pr ready` ok   | Mark bead complete; PR ready-for-review.               |
+"""
+formula = "mol-feature-ship"
+version = 1
+
+[vars]
+[vars.pr]
+description = "Draft PR number for the integration branch"
+required = true
+
+[vars.integration_branch]
+description = "Integration branch name (head ref of the draft PR; used for checkout and mail context)"
+required = true
+
+[vars.binding_prefix]
+description = "Pack binding prefix used to derive the witness target"
+default = "gastown-beads-lite."
+
+[vars.witness_target]
+description = "Qualified witness target. Empty means derive from $GC_RIG and binding_prefix."
+default = ""
+
+[[steps]]
+id = "intake"
+title = "Verify draft PR and check out the integration branch"
+description = """
+Confirm the PR exists in draft state, then check out the integration branch
+so the gates run against the right code. Record initial state in the root
+bead notes.
+
+Cross-step state is recorded with `--set-metadata` (overwrite-safe across
+steps); the running human log uses `--append-notes` so earlier breadcrumbs
+survive later updates. `bd update --notes` (no `--append-`) replaces the
+notes block, so any state the route step needs must live in metadata, not
+notes.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "[feature-ship] BLOCKED — not in a git repository."
+    bd update "$ROOT_ID" \\
+        --set-metadata ship_status=blocked \\
+        --set-metadata ship_gate=not_a_repo \\
+        --append-notes "feature-ship: BLOCKED — not in a git repository."
+    exit 1
+}
+cd "$REPO_ROOT"
+```
+
+### Resolve witness target up front
+
+The mail target is needed by every failure path in this step, so resolve it
+first.
+
+```bash
+WITNESS_TARGET="{{witness_target}}"
+if [ -z "$WITNESS_TARGET" ]; then
+    WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
+fi
+```
+
+### Confirm PR exists and is in draft
+
+```bash
+PR_INFO=$(gh pr view {{pr}} --json state,isDraft,headRefName,url 2>&1) || {
+    bd update "$ROOT_ID" \\
+        --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+        --set-metadata ship_status=blocked \\
+        --set-metadata ship_gate=pr_not_found \\
+        --append-notes "feature-ship: BLOCKED — gh pr view {{pr}} failed.
+$PR_INFO"
+    gc mail send "$WITNESS_TARGET" \\
+        -s "SHIP FAILED: PR #{{pr}} not found" \\
+        -m "Could not load PR #{{pr}} for integration branch {{integration_branch}}.
+
+gh pr view output:
+$PR_INFO"
+    echo "[feature-ship] BLOCKED — PR #{{pr}} not found. Witness mailed."
+    exit 1
+}
+
+PR_STATE=$(echo "$PR_INFO" | jq -r '.state')
+IS_DRAFT=$(echo "$PR_INFO" | jq -r '.isDraft')
+HEAD_REF=$(echo "$PR_INFO" | jq -r '.headRefName')
+PR_URL=$(echo "$PR_INFO" | jq -r '.url')
+
+if [ "$IS_DRAFT" != "true" ]; then
+    bd update "$ROOT_ID" \\
+        --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+        --set-metadata ship_status=blocked \\
+        --set-metadata ship_gate=pr_not_draft \\
+        --set-metadata ship_pr_url="$PR_URL" \\
+        --append-notes "feature-ship: BLOCKED — PR #{{pr}} state=$PR_STATE isDraft=$IS_DRAFT headRefName=$HEAD_REF (not in draft)."
+    gc mail send "$WITNESS_TARGET" \\
+        -s "SHIP FAILED: PR #{{pr}} is not in draft state" \\
+        -m "PR #{{pr}} (state=$PR_STATE, isDraft=$IS_DRAFT) cannot be marked
+ready-for-review by this formula because it is already out of draft.
+
+Integration branch: {{integration_branch}}
+PR URL: $PR_URL"
+    echo "[feature-ship] BLOCKED — PR #{{pr}} is not in draft (state=$PR_STATE). Witness mailed."
+    exit 1
+fi
+
+if [ "$HEAD_REF" != "{{integration_branch}}" ]; then
+    echo "[feature-ship] WARNING: PR #{{pr}} headRefName ($HEAD_REF) != integration_branch ({{integration_branch}})."
+    echo "[feature-ship]   Continuing with the caller-supplied integration_branch."
+fi
+```
+
+### Fetch and check out the integration branch
+
+```bash
+git fetch --prune origin
+if ! git fetch origin "+refs/heads/{{integration_branch}}:refs/remotes/origin/{{integration_branch}}"; then
+    bd update "$ROOT_ID" \\
+        --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+        --set-metadata ship_status=blocked \\
+        --set-metadata ship_gate=fetch_failed \\
+        --set-metadata ship_pr_url="$PR_URL" \\
+        --append-notes "feature-ship: BLOCKED — cannot fetch integration_branch={{integration_branch}}."
+    gc mail send "$WITNESS_TARGET" \\
+        -s "SHIP FAILED: cannot fetch {{integration_branch}}" \\
+        -m "Could not fetch integration branch {{integration_branch}} for PR #{{pr}}.
+
+Check that the branch exists on origin and that the polecat has fetch
+permission."
+    echo "[feature-ship] BLOCKED — cannot fetch {{integration_branch}}. Witness mailed."
+    exit 1
+fi
+git checkout -B "{{integration_branch}}" "origin/{{integration_branch}}"
+```
+
+### Record initial state
+
+Persist the values the route step will need in metadata (notes get
+overwritten by `--notes`, so we route cross-step state through metadata).
+
+```bash
+bd update "$ROOT_ID" \\
+    --set-metadata ship_pr={{pr}} \\
+    --set-metadata ship_pr_url="$PR_URL" \\
+    --set-metadata ship_integration_branch={{integration_branch}} \\
+    --set-metadata ship_head_ref="$HEAD_REF" \\
+    --set-metadata ship_witness_target="$WITNESS_TARGET" \\
+    --set-metadata ship_status=in_progress \\
+    --append-notes "feature-ship: intake ok — PR #{{pr}} ($PR_URL) in draft on {{integration_branch}} (head_ref=$HEAD_REF)."
+```
+
+**Exit criteria:** PR confirmed as draft; integration branch checked out at
+its remote tip; PR URL, integration branch, and witness target recorded on
+the root bead.
+"""
+
+[[steps]]
+id = "mechanical-gates"
+title = "Run all available mechanical gates"
+needs = ["intake"]
+description = """
+Run build / vet / lint / test / docs against the integration branch. Detect
+the language and build system from repo signals and run only the gates that
+apply.
+
+**Do NOT abort on the first failure.** Run every applicable gate so the
+failure summary in the route step is complete, then decide green/red based
+on collective exit codes.
+
+Per-gate stdout+stderr is captured to a dedicated log file in a temporary
+result directory so the route step can attach truncated tails to the
+witness mail. The result directory is recorded on the bead so the route
+step can find it.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+GATES_PASSED=""
+GATES_FAILED=""
+RESULT_DIR=$(mktemp -d -t feature-ship-{{pr}}-XXXXXX)
+```
+
+A small helper keeps each gate-block readable:
+
+```bash
+run_gate() {
+    local name="$1"; shift
+    local log="$RESULT_DIR/$name.log"
+    if "$@" > "$log" 2>&1; then
+        GATES_PASSED="$GATES_PASSED $name"
+    else
+        GATES_FAILED="$GATES_FAILED $name"
+    fi
+}
+```
+
+### Build
+
+```bash
+if [ -f Makefile ] && grep -q "^build:" Makefile; then
+    run_gate build make build
+elif [ -f go.mod ]; then
+    run_gate build go build ./...
+elif [ -f package.json ] && [ "$(jq -r '.scripts.build // ""' package.json 2>/dev/null)" != "" ]; then
+    run_gate build npm run build
+elif [ -f Cargo.toml ]; then
+    run_gate build cargo build
+fi
+```
+
+### Vet / lint / static analysis
+
+```bash
+if [ -f Makefile ] && grep -q "^lint:" Makefile; then
+    run_gate lint make lint
+elif [ -f go.mod ]; then
+    run_gate vet go vet ./...
+elif [ -f package.json ] && [ "$(jq -r '.scripts.lint // ""' package.json 2>/dev/null)" != "" ]; then
+    run_gate lint npm run lint
+elif [ -f Cargo.toml ]; then
+    run_gate clippy cargo clippy
+fi
+```
+
+### Tests
+
+```bash
+if [ -f Makefile ] && grep -q "^test:" Makefile; then
+    run_gate test make test
+elif [ -f go.mod ]; then
+    run_gate test go test ./...
+elif [ -f package.json ] && [ "$(jq -r '.scripts.test // ""' package.json 2>/dev/null)" != "" ]; then
+    run_gate test npm test
+elif [ -f Cargo.toml ]; then
+    run_gate test cargo test
+elif [ -f pyproject.toml ]; then
+    run_gate test pytest
+fi
+```
+
+### Docs
+
+Docs gates are repo-shaped: prefer `make check-docs`, fall back to
+`make docs`, then `scripts/check-docs.sh`. Run only what exists; absence is
+not a failure.
+
+```bash
+if grep -q "^check-docs:" Makefile 2>/dev/null; then
+    run_gate docs make check-docs
+elif grep -q "^docs:" Makefile 2>/dev/null; then
+    run_gate docs make docs
+elif [ -x scripts/check-docs.sh ]; then
+    run_gate docs scripts/check-docs.sh
+fi
+```
+
+### Record gate results
+
+State is written via `--set-metadata` because the route step needs to read
+it after this step's notes block may have been overwritten by other
+updates. The `--append-notes` line adds a human-readable breadcrumb.
+
+```bash
+bd update "$ROOT_ID" \\
+    --set-metadata ship_gates_passed="$GATES_PASSED" \\
+    --set-metadata ship_gates_failed="$GATES_FAILED" \\
+    --set-metadata ship_result_dir="$RESULT_DIR" \\
+    --append-notes "feature-ship: gates ran
+  passed:$GATES_PASSED
+  failed:$GATES_FAILED
+  result_dir: $RESULT_DIR"
+```
+
+**Exit criteria:** Every applicable gate has been run exactly once. Pass /
+fail status is recorded in metadata `ship_gates_passed` / `ship_gates_failed`.
+Per-gate logs live in `$RESULT_DIR` and the path is recorded on the bead
+for the route step.
+"""
+
+[[steps]]
+id = "route"
+title = "Route to ready-for-review (green) or witness (red)"
+needs = ["mechanical-gates"]
+description = """
+Branch on the collected gate results. **No auto-merge, no auto-fix bead.**
+Either mark the PR ready for human review, or mail the witness with a
+truncated failure summary and block the bead.
+
+All cross-step state lives in metadata under `ship_*` keys (see intake +
+mechanical-gates). Read it back as a single JSON blob so each key resolves
+deterministically — grep'ing freetext notes is unsafe because `--notes`
+overwrites and other updates may have happened between steps.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+META=$(bd show "$ROOT_ID" --json | jq -c '.[0].metadata')
+GATES_PASSED=$(echo "$META" | jq -r '.ship_gates_passed // ""')
+GATES_FAILED=$(echo "$META" | jq -r '.ship_gates_failed // ""')
+RESULT_DIR=$(echo "$META" | jq -r '.ship_result_dir // ""')
+WITNESS_TARGET=$(echo "$META" | jq -r '.ship_witness_target // ""')
+PR_URL=$(echo "$META" | jq -r '.ship_pr_url // ""')
+```
+
+### Green path — gh pr ready and mark complete
+
+A "green" run has an empty `GATES_FAILED` (after trimming whitespace) AND
+at least one gate that actually passed. A run with zero applicable gates
+is suspicious and should NOT be treated as green.
+
+```bash
+GF_TRIMMED=$(echo "$GATES_FAILED" | tr -d ' ')
+GP_TRIMMED=$(echo "$GATES_PASSED" | tr -d ' ')
+
+if [ -z "$GF_TRIMMED" ] && [ -n "$GP_TRIMMED" ]; then
+    if ! gh pr ready {{pr}}; then
+        bd update "$ROOT_ID" \\
+            --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+            --set-metadata ship_status=blocked \\
+            --set-metadata ship_gate=gh_pr_ready_failed \\
+            --append-notes "feature-ship: BLOCKED — all gates passed but 'gh pr ready {{pr}}' failed.
+  gates_passed:$GATES_PASSED"
+        gc mail send "$WITNESS_TARGET" \\
+            -s "SHIP FAILED: gh pr ready failed for PR #{{pr}}" \\
+            -m "All mechanical gates passed but 'gh pr ready {{pr}}' did not.
+
+Integration branch: {{integration_branch}}
+PR URL: $PR_URL
+Gates passed:$GATES_PASSED
+
+Manual intervention required — check 'gh auth status', PR permissions, or
+whether the PR was concurrently modified."
+        echo "[feature-ship] BLOCKED — gates green but 'gh pr ready' failed. Witness mailed."
+        exit 1
+    fi
+
+    bd update "$ROOT_ID" \\
+        --set-metadata ship_status=complete \\
+        --set-metadata ship_pr_status=ready_for_review \\
+        --append-notes "feature-ship: GREEN — PR #{{pr}} marked ready-for-review.
+  gates_passed:$GATES_PASSED"
+    bd close "$ROOT_ID" --reason "PR #{{pr}} marked ready-for-review after gates green"
+    echo "[feature-ship] GREEN — PR #{{pr}} marked ready-for-review."
+    echo "[feature-ship]   Integration branch: {{integration_branch}}"
+    echo "[feature-ship]   PR URL: $PR_URL"
+    echo "[feature-ship]   Human picks up from GitHub."
+    rm -rf "$RESULT_DIR"
+    exit 0
+fi
+
+if [ -z "$GF_TRIMMED" ] && [ -z "$GP_TRIMMED" ]; then
+    # No gates ran at all — the language / build signals we look for are
+    # absent. Treat as a configuration problem and escalate to witness.
+    bd update "$ROOT_ID" \\
+        --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+        --set-metadata ship_status=blocked \\
+        --set-metadata ship_gate=no_gates_ran \\
+        --append-notes "feature-ship: BLOCKED — mechanical-gates step ran no checks. No language or build signal detected on integration branch."
+    gc mail send "$WITNESS_TARGET" \\
+        -s "SHIP FAILED: no mechanical gates ran for PR #{{pr}}" \\
+        -m "mol-feature-ship found no Makefile, go.mod, package.json,
+Cargo.toml, or pyproject.toml signal on integration branch
+{{integration_branch}}. The formula refused to mark the PR ready-for-review
+without at least one passing gate.
+
+Integration branch: {{integration_branch}}
+PR URL: $PR_URL
+
+Either extend mol-feature-ship to support this repo's build system, or
+mark the PR ready-for-review manually after the appropriate manual checks."
+    echo "[feature-ship] BLOCKED — no gates ran. Witness mailed."
+    exit 1
+fi
+```
+
+### Red path — mail witness, mark blocked, route to witness
+
+Build the failure summary, truncate each failed gate's log to the last 200
+lines per the bead's contract, mail witness, mark the bead blocked, and
+route to witness so the witness session can pick it up.
+
+```bash
+SUMMARY_FILE=$(mktemp)
+{
+    echo "Mechanical gates failed for integration branch {{integration_branch}} (PR #{{pr}})."
+    echo
+    echo "PR URL: $PR_URL"
+    echo "Gates passed:$GATES_PASSED"
+    echo "Gates failed:$GATES_FAILED"
+    echo
+    echo "Detail (last 200 lines per failed gate):"
+    for gate in $GATES_FAILED; do
+        echo
+        echo "## $gate"
+        log="$RESULT_DIR/$gate.log"
+        if [ -f "$log" ]; then
+            tail -n 200 "$log"
+        else
+            echo "(no log captured for $gate)"
+        fi
+    done
+} > "$SUMMARY_FILE"
+
+# Truncate the summary itself to a sane size before stuffing it into a
+# mail body and the bead's failure_summary note. Witness mail is for human
+# triage — a multi-megabyte log dump is worse than a clear pointer.
+SUMMARY_TRUNC=$(mktemp)
+head -c 32768 "$SUMMARY_FILE" > "$SUMMARY_TRUNC"
+if [ "$(wc -c < "$SUMMARY_FILE")" -gt 32768 ]; then
+    echo "" >> "$SUMMARY_TRUNC"
+    echo "[summary truncated — full per-gate logs in $RESULT_DIR on the polecat host]" >> "$SUMMARY_TRUNC"
+fi
+
+bd update "$ROOT_ID" \\
+    --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+    --set-metadata ship_status=blocked \\
+    --set-metadata ship_gate=mechanical_red \\
+    --append-notes "feature-ship: RED — mechanical gates failed.
+  gates_passed:$GATES_PASSED
+  gates_failed:$GATES_FAILED
+  failure_summary: see witness mail"
+
+gc mail send "$WITNESS_TARGET" \\
+    -s "SHIP FAILED: PR #{{pr}} for {{integration_branch}}" \\
+    -m "$(cat "$SUMMARY_TRUNC")"
+
+rm -f "$SUMMARY_FILE" "$SUMMARY_TRUNC"
+
+echo "[feature-ship] RED — witness mailed. Human triage required."
+echo "[feature-ship]   Failed gates:$GATES_FAILED"
+echo "[feature-ship]   PR URL: $PR_URL"
+echo "[feature-ship]   Bead $ROOT_ID marked blocked; gc.routed_to=$WITNESS_TARGET."
+exit 1
+```
+
+**Note:** Do NOT auto-file a fix bead here. Gate failures at this stage are
+usually environmental (CI flake, missing tool, build infra) and need human
+judgment — auto-firing a polecat would just chase its tail.
+
+**Exit criteria (green):** PR marked ready-for-review via `gh pr ready`;
+metadata `ship_status=complete`, `ship_pr_status=ready_for_review`; bead
+closed.
+
+**Exit criteria (red):** Witness mailed with a truncated summary; metadata
+`ship_status=blocked`, `ship_gate=mechanical_red` (or the originating
+upstream failure mode); `gc.routed_to` is set to the rig witness so the
+witness session can pick the bead up.
+"""
