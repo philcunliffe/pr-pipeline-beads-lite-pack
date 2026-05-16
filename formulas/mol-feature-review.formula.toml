@@ -39,8 +39,9 @@ the convention — it consumes it.
 4. Verdict (`approve` | `request_changes` | `block`) is read from the
    sub-formula bead's notes
 5. On `approve`: root bead notes record `verdict: approve` and
-   `status: complete`. The refinery's post-merge routing files the
-   subsequent ship bead.
+   `status: complete`. The formula files the subsequent ship bead
+   inline (with full feature-flow metadata), then closes the review
+   bead so the polecat drains cleanly.
 6. On `block` / `request_changes`: a rollup fix bead is filed against
    the integration branch with the full metadata convention.
 
@@ -269,12 +270,68 @@ RIG="${GC_RIG:-<rig>}"
 
 ### Approve path
 
+On approve, the formula files the ship bead directly and closes this
+review bead. We don't rely on the refinery's post-merge routing here:
+`mol-feature-refinery-patrol` requires `metadata.branch` at intake, and
+review beads carry no polecat branch — they'd fall through. Match the
+request_changes/block path's pattern: do the routing inline.
+
 ```bash
 if [ "$VERDICT" = "approve" ]; then
     bd update "$ROOT_ID" --notes "verdict: approve
 review_report: $REPORT_PATH
 status: complete"
-    echo "[feature-review] APPROVED — refinery will route ship bead."
+
+    POLECAT_TARGET="${GC_RIG:+$GC_RIG/}gastown-beads-lite.polecat"
+    FINAL_TARGET=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.final_target // "main"')
+
+    SHIP_BODY_FILE=$(mktemp -t feature-ship-body.XXXXXX.md)
+    cat > "$SHIP_BODY_FILE" <<EOF
+Auto-filed by mol-feature-review approve path for {{integration_branch}}.
+
+Run mol-feature-ship against draft PR #{{pr}}. On all-green, the formula
+flips the draft PR to ready-for-review (gh pr ready).
+EOF
+
+    SHIP_ID=$(bd create "Feature ship: {{integration_branch}}" \\
+        --description-file "$SHIP_BODY_FILE" --json \\
+        | jq -r '.id // .[0].id // empty')
+    rm -f "$SHIP_BODY_FILE"
+
+    if [ -z "$SHIP_ID" ] || [ "$SHIP_ID" = "null" ]; then
+        # Routing failed — surface for human handoff. Keep the review bead
+        # in_progress so the issue stays visible; do not close it.
+        bd update "$ROOT_ID" \\
+            --set-metadata gc.routed_to=human \\
+            --set-metadata blocked_reason="feature-review: approve path could not file ship bead (bd create returned empty)"
+        gc mail send "${GC_RIG:+$GC_RIG/}gastown-beads-lite.witness" \\
+            -s "ESCALATION: feature-review could not file ship bead for {{integration_branch}}" \\
+            -m "Review bead: $ROOT_ID
+Verdict: approve
+Integration: {{integration_branch}}
+PR: #{{pr}}
+
+Failed to create ship bead via bd create. Manual recovery: file a feature-ship bead by hand and sling to polecat pool." 2>&1 || true
+        echo "[feature-review] APPROVED but ship-bead filing FAILED — escalated"
+        exit 1
+    fi
+
+    bd update "$SHIP_ID" \\
+        --set-metadata "target={{integration_branch}}" \\
+        --set-metadata "merge_strategy=integration" \\
+        --set-metadata "feature_phase=ship" \\
+        --set-metadata "formula=mol-feature-ship" \\
+        --set-metadata "pr={{pr}}" \\
+        --set-metadata "integration_branch={{integration_branch}}" \\
+        --set-metadata "final_target=$FINAL_TARGET" \\
+        --set-metadata "gc.routed_to=$POLECAT_TARGET" \\
+        --set-metadata "source_review_bead=$ROOT_ID"
+
+    # Close the review bead — the polecat that ran this formula is now
+    # done with this bead and should drain.
+    bd close "$ROOT_ID" --reason "feature-review approved; filed ship bead $SHIP_ID"
+
+    echo "[feature-review] APPROVED — filed ship bead $SHIP_ID"
     echo "[feature-review]   Integration branch: {{integration_branch}}"
     echo "[feature-review]   PR #{{pr}}"
     echo "[feature-review]   Report: $REPORT_PATH"
@@ -399,7 +456,14 @@ fi
 ```
 
 **Exit criteria:**
-- `approve` → bead notes record verdict + status complete; no fix bead.
+- `approve` → ship bead created with `target=integration_branch`,
+  `merge_strategy=integration`, `feature_phase=ship`,
+  `formula=mol-feature-ship`, `pr`, `integration_branch`,
+  `final_target`, `gc.routed_to=<rig>/gastown-beads-lite.polecat`,
+  `source_review_bead`; root review bead records verdict + status
+  complete and is **closed** with a reason referencing the ship bead.
+- `approve` ship-bead filing failure → review bead stays in_progress
+  with `gc.routed_to=human` and `blocked_reason` set; witness mailed.
 - `request_changes` / `block` → rollup fix bead exists with
   `target`, `feature_phase=fix`, `merge_strategy=integration`,
   `gc.routed_to=<rig>/gastown-beads-lite.polecat`, `pr`,
