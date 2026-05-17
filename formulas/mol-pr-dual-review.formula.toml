@@ -1,0 +1,779 @@
+description = """
+Dual-agent PR review for outgoing PRs. Runs Claude's `/code-review-quiet`
+skill (5-Sonnet parallel scan + Haiku confidence scoring) and Codex's
+review prompt in parallel against the same PR, then composes a risk
+capstone via `mol-pr-blast-radius` to classify the change surface, and
+computes a single mechanical verdict from the union of all signals.
+
+Sub-formula contract: callers (notably `mol-feature-review`) read
+`verdict:` from the root bead's notes. The contract value space is
+`approve | request_changes | block`, identical to `mol-pr-review`'s
+contract so the new formula is drop-in compatible.
+
+This formula does NOT post a GitHub comment. The `/code-review-quiet`
+skill is invoked with `--no-comment --output` so its structured
+comment body is written to the report directory, not posted. Any
+maintainer-visible comment is the caller's responsibility (e.g. the
+`mol-adopt-pr` finalize step in the `pr-review` pack).
+
+## Beads-Lite Command Note
+
+In gastown-beads-lite rig sessions, translate the `bd ...` examples below to:
+
+```bash
+BEADS_DIR=<rig-root>/.beads gc gastown-beads-lite bd ...
+```
+
+Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
+
+## Contract
+
+1. Caller slings with `--var pr=<url-or-number>` (and optional
+   `--var integration_branch=<branch-name>`)
+2. Agent works through 5 sequential steps:
+   intake → dual-review → risk-capstone → verdict → complete
+3. Reports written to
+   `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>/{codex.md,claude.md,risk.md,dual-review.md}`
+4. Root-bead notes record `verdict:`, `risk_class:`, and
+   `report_path:` pointing at the combined index
+5. Agent exits — no fixes are applied
+
+## Failure Modes
+
+| Situation | Action |
+|-----------|--------|
+| PR does not exist | gh fails; record error in root notes, close bead with reason |
+| One reviewer produces empty output | Record which one; the other still contributes findings; verdict computed on what's available |
+| Both reviewers produce empty output | Record blocked, exit nonzero, do not synthesize |
+| mol-pr-blast-radius sub-formula fails | Record blocked, exit nonzero, do not compute verdict |
+| Verdict cannot be parsed | Record blocked, exit nonzero |
+
+The polecat that runs this formula handles failure escalation per its
+own rig conventions (e.g. `gc mail send` to the witness)."""
+formula = "mol-pr-dual-review"
+version = 1
+
+[vars]
+[vars.pr]
+description = "PR URL (https://github.com/owner/repo/pull/N) or bare integer in current repo"
+required = true
+
+[vars.integration_branch]
+description = "Optional integration branch label, recorded in notes for callers that want it surfaced"
+default = ""
+
+[[steps]]
+id = "intake"
+title = "Resolve PR, fetch metadata + diff, set up report directory"
+description = """
+Resolve the PR identifier, fetch its data, and prepare the workspace.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Not in a git repository — cannot review PR."
+    bd close "$ROOT_ID" --reason "not a git checkout"
+    exit 1
+}
+cd "$REPO_ROOT"
+```
+
+Parse `{{pr}}`:
+
+- If `{{pr}}` matches `https://github.com/.*/pull/\\d+` → extract
+  owner/repo/number
+- If `{{pr}}` is a bare integer → use current repo (`gh repo view --json
+  nameWithOwner -q .nameWithOwner`)
+
+Capture the PR number into `PR_NUM` for use below.
+
+Fetch metadata, diff, and changed files in parallel:
+
+```bash
+gh pr view "$PR_NUM" --repo "$REPO" --json \\
+    number,title,body,author,baseRefName,headRefName,additions,deletions,\\
+    changedFiles,mergeable,url,state,labels \\
+    > "/tmp/pr-$PR_NUM-metadata.json" &
+META_PID=$!
+
+gh pr diff "$PR_NUM" --repo "$REPO" > "/tmp/pr-$PR_NUM.diff" &
+DIFF_PID=$!
+
+gh pr view "$PR_NUM" --repo "$REPO" --json files --jq '.files[].path' \\
+    > "/tmp/pr-$PR_NUM.files" &
+FILES_PID=$!
+
+wait "$META_PID" "$DIFF_PID" "$FILES_PID"
+```
+
+Prepare the report directory:
+
+```bash
+if [ -n "${GC_CITY_PATH:-}" ]; then
+    REPORT_DIR="${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-${PR_NUM}"
+else
+    REPORT_DIR=".gc/pr-pipeline/reviews/pr-${PR_NUM}"
+fi
+mkdir -p "$REPORT_DIR"
+```
+
+Record initial state on the root bead:
+
+```bash
+bd update "$ROOT_ID" --notes "pr: $PR_NUM
+repo: $REPO
+report_path: $REPORT_DIR
+integration_branch: {{integration_branch}}
+status: in_progress"
+```
+
+**Exit criteria:** PR metadata + diff + file list captured under
+`/tmp/`, `REPORT_DIR` exists, root-bead notes record `pr`, `repo`,
+`report_path`, and `status: in_progress`.
+"""
+
+[[steps]]
+id = "dual-review"
+title = "Run Codex and Claude reviewers in parallel"
+needs = ["intake"]
+description = """
+Run two reviewers against the PR in parallel. Codex runs as a
+background subprocess via the PTY wrapper. Claude runs in the
+foreground using the `/code-review-quiet` skill (forked from the
+`code-review` plugin) with `--no-comment --output` so the structured
+comment body is written to a file instead of posted to GitHub.
+
+Read the values captured in `intake` from root-bead notes:
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+PR_NUM=$(echo "$NOTES" | grep -m1 '^pr:'           | sed 's/^pr: //')
+REPO=$(echo    "$NOTES" | grep -m1 '^repo:'         | sed 's/^repo: //')
+REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+```
+
+### Build the Codex prompt and PTY wrapper
+
+Write the Codex review prompt and the aimux PTY wrapper to a temp
+directory. The Codex review prompt is inlined here (sourced from
+`overlay/.claude/skills/review-pr/SKILL.md` in the `pr-review` pack,
+the canonical `codex-reviewer` prompt as of 2026-05). Factor out into a
+standalone skill in a follow-up when a second caller needs it.
+
+```bash
+WORK_DIR=$(mktemp -d -t pr-dual-review-XXXXXX)
+trap 'rm -rf "$WORK_DIR"' EXIT
+PROMPT_DIR="$WORK_DIR/prompts"
+SCRIPT_DIR="$WORK_DIR/scripts"
+mkdir -p "$PROMPT_DIR" "$SCRIPT_DIR"
+```
+
+Compose the PR context block (metadata + diff) once, then prepend the
+Codex role prompt:
+
+```bash
+CONTEXT_FILE="$WORK_DIR/pr-context.md"
+{
+    META=$(cat "/tmp/pr-${PR_NUM}-metadata.json")
+    TITLE=$(echo "$META"   | jq -r '.title // "(no title)"')
+    AUTHOR=$(echo "$META"  | jq -r '.author.login // "(unknown)"')
+    BASE=$(echo "$META"    | jq -r '.baseRefName // ""')
+    HEAD=$(echo "$META"    | jq -r '.headRefName // ""')
+    ADDS=$(echo "$META"    | jq -r '.additions // 0')
+    DELS=$(echo "$META"    | jq -r '.deletions // 0')
+    NFILES=$(echo "$META"  | jq -r '.changedFiles // 0')
+    BODY=$(echo "$META"    | jq -r '.body // ""')
+
+    echo "## PR Context"
+    echo ""
+    echo "PR #${PR_NUM}: ${TITLE}"
+    echo "Author: ${AUTHOR}"
+    echo "Base: ${BASE} <- Head: ${HEAD}"
+    echo "Stats: +${ADDS} -${DELS} across ${NFILES} files"
+    echo ""
+    echo "### Description"
+    echo "${BODY}"
+    echo ""
+    echo "### Changed Files"
+    cat "/tmp/pr-${PR_NUM}.files"
+    echo ""
+    echo "### Full Diff"
+    echo '```diff'
+    cat "/tmp/pr-${PR_NUM}.diff"
+    echo '```'
+} > "$CONTEXT_FILE"
+```
+
+Write the Codex role prompt and concatenate with the context:
+
+```bash
+cat > "$PROMPT_DIR/codex-role.md" <<'CODEXROLE'
+You are "codex-reviewer" for a code review. The codebase under review
+may use any language; treat the diff as authoritative and the worktree
+as supporting context.
+
+## Mission
+
+Produce a high-signal, evidence-first review focused on concrete code
+impact and repo-wide traceability. Your strength is indexing and tracing
+-- use it. Find every caller, every test, every contract touchpoint.
+
+IMPORTANT: You MUST produce a final review with findings. Do NOT spend
+all your time reading files. The diff below contains all changed code.
+Focus your analysis on the diff itself. Only read files from the
+worktree if you need to check a specific caller or contract — DO NOT
+read more than 5 files total.
+
+## Category Taxonomy (use exactly)
+
+1) Behavioral Correctness
+2) Contract & Interface Fidelity
+3) Change Impact / Blast Radius
+4) Concurrency, Ordering & State Safety
+5) Error Handling & Resilience
+6) Security Surface
+7) Resource Lifecycle & Cleanup
+8) Release Safety
+9) Test Evidence Quality
+10) Architectural Consistency
+11) Debuggability & Operability
+
+Priority: P0 = categories 1-4 (aggressively check). P1 = 5-8. P2 = 9-11.
+
+## How to Work
+
+### Codebase Access
+You are running from a git worktree checked out at the PR head. The
+full diff is included in this prompt. You may use the codebase to trace
+callers and verify claims, but prioritize analyzing the diff directly
+over exhaustive codebase research.
+
+### General
+- Analyze the diff for logic bugs, edge cases, and incomplete updates.
+- Identify contract touchpoints: CLI flags, API signatures, config
+  structs, schemas, hook protocols.
+- Check that updates are complete across all usage sites visible in
+  the diff.
+- Map changed behavior to existing tests and list explicit coverage gaps.
+- Check cleanup paths (files, sessions, worktrees, goroutines) on both
+  success AND failure.
+- Check that error messages and log output remain useful for debugging.
+
+### Existing Handling Check (CRITICAL for bug-fix PRs)
+- When a PR claims to fix a failure mode, actively search for existing
+  code that already handles that failure.
+- Specifically search for: error recovery paths, retry logic, conflict
+  resolution, fallback branches.
+- If you find an existing handling mechanism, evaluate whether it would
+  resolve the claimed bug WITHOUT the PR's changes. Cite the handler
+  with path:line evidence.
+
+## Output Format
+
+CRITICAL: Separate fix validations from new findings.
+
+Start with "## Fix Validations" (if the PR fixes bugs):
+
+### <what was broken>
+- **Status:** correct | incomplete | wrong
+- **Evidence:** path:line
+- **Assessment:** [1-2 sentences]
+
+Then "## Findings" for NEW issues only:
+
+### [Category Name]
+- **Severity:** blocker|major|minor|nit
+- **Confidence:** high|medium|low
+- **Evidence:** path:line[, path:line]
+- **Why it matters:** [one sentence]
+- **Suggested fix:** [concrete action]
+
+Then "## No Finding" for categories with no issues (list them explicitly).
+
+End with:
+## Evidence Bundle
+- **Changed hot paths:** [list]
+- **Impacted callers:** [list with path:line]
+- **Impacted tests:** [list with path:line]
+- **Unresolved uncertainty:** [list]
+
+## Constraints
+- No style/formatting issues unless they create behavioral risk.
+- No invented behavior -- cite code evidence for every claim.
+- Prefer precise path:line references over broad claims.
+- Fewer high-signal findings >> exhaustive speculative lists.
+- Do NOT list pre-existing bugs that the PR fixes as "findings".
+CODEXROLE
+
+# Final Codex prompt = role + context
+cat "$PROMPT_DIR/codex-role.md" "$CONTEXT_FILE" > "$PROMPT_DIR/codex-reviewer.md"
+```
+
+Write the Codex PTY wrapper script (verbatim pattern from the
+`review-pr` skill — exec via `script -q -e -f -c`, NOT `-o`):
+
+```bash
+cat > "$SCRIPT_DIR/aimux-codex.sh" <<'CODEXWRAP'
+#!/usr/bin/env bash
+# aimux-codex.sh — PTY-wrapped Codex invocation via aimux
+# Usage: aimux-codex.sh <prompt_file> <output_file> [timeout_seconds]
+set -euo pipefail
+
+PROMPT_FILE="$1"
+OUTPUT_FILE="$2"
+TIMEOUT="${3:-600}"
+
+if [[ ! -f "$PROMPT_FILE" ]]; then
+  echo "ERROR: Prompt file not found: $PROMPT_FILE" >&2
+  exit 1
+fi
+
+LOG_FILE=$(mktemp /tmp/codex-pty-XXXXXX.log)
+trap 'rm -f "$LOG_FILE"' EXIT
+
+CMD_FILE=$(mktemp /tmp/codex-cmd-XXXXXX.sh)
+printf 'unset CLAUDECODE; command cat %q | aimux run codex -m gpt-5.3-codex exec --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' -- -\\n' "$PROMPT_FILE" > "$CMD_FILE"
+chmod +x "$CMD_FILE"
+
+timeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+
+rm -f "$CMD_FILE"
+
+python3 -c '
+import re, sys
+
+text = open(sys.argv[1], "r", errors="replace").read()
+text = re.sub(r"^Script (started|done) on .*\\n?", "", text, flags=re.MULTILINE)
+text = re.sub(r"\\x1bP[^\\x1b]*\\x1b\\\\\\\\", "", text)
+text = re.sub(r"\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\\\\\)", "", text)
+text = re.sub(r"\\x1b\\[[\\x20-\\x3f]*[\\x40-\\x7e]", "", text)
+text = re.sub(r"\\x1b[()][A-Za-z0-9]", "", text)
+text = re.sub(r"\\x1b[\\x40-\\x7e]", "", text)
+text = text.replace("\\r", "")
+
+blocks = []
+lines = text.split("\\n")
+in_codex_block = False
+current_block = []
+
+for line in lines:
+    stripped = line.strip()
+    if stripped == "codex":
+        if current_block and in_codex_block:
+            blocks.append("\\n".join(current_block))
+        in_codex_block = True
+        current_block = []
+    elif in_codex_block and stripped in ("thinking", "exec", "user"):
+        blocks.append("\\n".join(current_block))
+        in_codex_block = False
+        current_block = []
+    elif in_codex_block:
+        current_block.append(line)
+
+if in_codex_block and current_block:
+    blocks.append("\\n".join(current_block))
+
+if blocks:
+    longest = max(blocks, key=len)
+    sys.stdout.write(longest.strip() + "\\n")
+else:
+    sys.stdout.write(text)
+' "$LOG_FILE" > "$OUTPUT_FILE"
+
+if [[ ! -s "$OUTPUT_FILE" ]]; then
+  echo "ERROR: Codex produced empty output. Check aimux status." >&2
+  tail -50 "$LOG_FILE" >&2 || true
+  exit 1
+fi
+CODEXWRAP
+chmod +x "$SCRIPT_DIR/aimux-codex.sh"
+```
+
+> The doubled backslashes in the heredoc above are intentional: the
+> heredoc body becomes singly-escaped sequences in the written
+> `aimux-codex.sh` script, which Python then interprets as regex / ANSI
+> escapes. This mirrors the canonical wrapper in the `review-pr` skill.
+
+### Launch both reviewers in parallel
+
+Background-fork Codex; foreground-invoke Claude via the
+`/code-review-quiet` skill with the no-comment / output flags so the
+structured body is written to a file instead of posted to GitHub.
+
+```bash
+# Codex — background
+bash "$SCRIPT_DIR/aimux-codex.sh" \\
+    "$PROMPT_DIR/codex-reviewer.md" \\
+    "$REPORT_DIR/codex.md" \\
+    900 &
+CODEX_PID=$!
+```
+
+Then, in the same step, the polecat (running Claude) invokes the
+forked `code-review-quiet` skill in-process via the Skill tool with the
+arguments `<PR_NUM> --no-comment --output $REPORT_DIR/claude.md`. The
+skill is responsible for writing `$REPORT_DIR/claude.md`.
+
+After the skill returns, wait on Codex:
+
+```bash
+wait "$CODEX_PID" || true   # Don't propagate codex failure; we check files
+```
+
+### Validate outputs
+
+```bash
+CODEX_OK=0
+CLAUDE_OK=0
+[ -s "$REPORT_DIR/codex.md" ]  && CODEX_OK=1
+[ -s "$REPORT_DIR/claude.md" ] && CLAUDE_OK=1
+
+if [ "$CODEX_OK" = 0 ] && [ "$CLAUDE_OK" = 0 ]; then
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: both reviewers produced empty output"
+    echo "[dual-review] both reviewers empty — blocked"
+    exit 1
+fi
+
+bd update "$ROOT_ID" --notes "codex_ok: $CODEX_OK
+claude_ok: $CLAUDE_OK"
+```
+
+**Exit criteria:** at least one of `$REPORT_DIR/codex.md` and
+`$REPORT_DIR/claude.md` is non-empty; both states recorded on root bead.
+"""
+
+[[steps]]
+id = "risk-capstone"
+title = "Run mol-pr-blast-radius and cross-reference with reviewer findings"
+needs = ["dual-review"]
+description = """
+Invoke `mol-pr-blast-radius` as a sub-formula to map the impact surface
+of the PR. Read its `risk_class:` emit from sub-bead notes, then build
+a cross-reference table by walking the reviewers' reports for findings
+that intersect with high-blast-radius surfaces.
+
+Read the values captured in `intake`:
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+PR_NUM=$(echo "$NOTES" | grep -m1 '^pr:'           | sed 's/^pr: //')
+REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+RIG="${GC_RIG:-<rig>}"
+```
+
+Build a scope description for `mol-pr-blast-radius` from the PR's
+changed files (the sub-formula takes `--var scope=<free-text>`, not a
+PR number directly):
+
+```bash
+CHANGED_FILES=$(cat "/tmp/pr-${PR_NUM}.files" | head -50 | tr '\\n' ' ')
+SCOPE="PR #${PR_NUM} changed files: ${CHANGED_FILES}"
+KEY="pr-${PR_NUM}"
+```
+
+Sling `mol-pr-blast-radius` and capture the sub-bead ID. Note that
+`mol-pr-blast-radius` is in the same pack, so we invoke it via the
+pack-binding sling form:
+
+```bash
+SUB_OUT=$(gc "${RIG}/pr-pipeline" sling mol-pr-blast-radius --formula \\
+    --var "scope=$SCOPE" --var "key=$KEY" 2>&1)
+BLAST_BEAD=$(echo "$SUB_OUT" | grep -oE 'prblp-[a-z0-9]+' | tail -1)
+
+if [ -z "$BLAST_BEAD" ]; then
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: could not capture blast-radius sub-bead"
+    exit 1
+fi
+
+bd update "$ROOT_ID" --notes "blast_radius_bead: $BLAST_BEAD"
+```
+
+If the rig doesn't expose `gc <rig>/pr-pipeline sling ...`, fall back
+to a direct sling against the polecat pool:
+
+```bash
+gc sling "${RIG}/gastown-beads-lite.polecat" mol-pr-blast-radius \\
+    --formula --var "scope=$SCOPE" --var "key=$KEY"
+```
+
+Wait for the sub-bead to close (same pattern `mol-feature-review` uses
+to wait on `mol-pr-review`):
+
+```bash
+for _ in $(seq 1 120); do
+    STATUS=$(bd show "$BLAST_BEAD" --json \\
+        | jq -r '.[0].notes // ""' \\
+        | grep -m1 '^status:' | sed 's/^status: //' || true)
+    if [ "$STATUS" = "complete" ]; then
+        break
+    fi
+    sleep 10
+done
+
+if [ "$STATUS" != "complete" ]; then
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: blast-radius sub-bead $BLAST_BEAD did not complete"
+    exit 1
+fi
+```
+
+Read `risk_class` from the sub-bead's notes (emitted by the updated
+`mol-pr-blast-radius` produce-report step):
+
+```bash
+RISK_CLASS=$(bd show "$BLAST_BEAD" --json \\
+    | jq -r '.[0].notes // ""' \\
+    | grep -m1 '^risk_class:' | sed 's/^risk_class: //')
+
+case "$RISK_CLASS" in
+    low|medium|high) ;;
+    *) RISK_CLASS="low" ;;   # Safe default if classification absent
+esac
+
+bd update "$ROOT_ID" --notes "risk_class: $RISK_CLASS"
+```
+
+Capture the blast-radius report path and Risks section for the
+cross-reference table:
+
+```bash
+BLAST_REPORT=$(bd show "$BLAST_BEAD" --json \\
+    | jq -r '.[0].notes // ""' \\
+    | grep -m1 '^report_path:' | sed 's/^report_path: //')
+```
+
+Build the risk capstone report. Walk the reviewer reports for any
+file:line citations that appear in the blast-radius report's Targets,
+Direct callers, or Risks sections; list each match in the
+cross-reference table:
+
+```bash
+cat > "$REPORT_DIR/risk.md" <<RISKMD
+# Risk capstone for PR #${PR_NUM}
+
+- **risk_class:** ${RISK_CLASS}
+- **blast-radius report:** ${BLAST_REPORT}
+- **blast-radius bead:** ${BLAST_BEAD}
+
+## Cross-reference: reviewer findings that intersect high-risk surfaces
+
+| Source          | Finding (severity, evidence)                                | Intersects |
+|-----------------|-------------------------------------------------------------|------------|
+RISKMD
+```
+
+The polecat populates the table manually by reading `$REPORT_DIR/codex.md`,
+`$REPORT_DIR/claude.md`, and `$BLAST_REPORT`. For each reviewer finding
+whose evidence (path:line) appears in the blast-radius report's
+**Targets**, **Direct callers**, **Concurrency surface**, or **Risks**
+section, add a row to the table noting which section it intersects.
+
+If no findings intersect, write a single row `| (none)  | (none)
+| (none)     |` so downstream parsers can detect the empty case.
+
+After populating the table:
+
+```bash
+{
+    echo ""
+    echo "## Notes"
+    echo ""
+    echo "- High-risk surfaces with no reviewer coverage may warrant"
+    echo "  additional tests or a follow-up audit."
+    echo "- Reviewer findings on low-risk surfaces are typically safe to"
+    echo "  treat at their stated severity."
+} >> "$REPORT_DIR/risk.md"
+```
+
+**Exit criteria:** `$REPORT_DIR/risk.md` exists, `risk_class` is one of
+`{low, medium, high}` and is recorded on the root bead's notes,
+`blast_radius_bead` is recorded.
+"""
+
+[[steps]]
+id = "verdict"
+title = "Compute mechanical verdict from reviewer findings and risk class"
+needs = ["risk-capstone"]
+description = """
+Parse `$REPORT_DIR/codex.md` and `$REPORT_DIR/claude.md` for findings
+by severity, then apply the decision rubric:
+
+| Condition                                                             | Verdict          |
+|-----------------------------------------------------------------------|------------------|
+| Any blocker in categories 1-4 (in either review)                      | block            |
+| Any blocker in categories 5-8 (in either review) OR risk_class=high   | request_changes  |
+| Majors in any category 1-8 OR (risk_class=medium AND any findings)    | request_changes  |
+| Otherwise (only minors, nits, or no findings)                         | approve          |
+
+Note: the cat 1-4 vs cat 5-8 numbering is the `mol-pr-review` 11-
+category taxonomy. The Codex prompt above uses that taxonomy.
+`/code-review-quiet`'s output does not — it has free-form severities
+(blocker / major / minor / nit). Be permissive in parsing:
+
+- Anything explicitly marked "blocker" or that mentions "BUG" /
+  "critical" in the heading → blocker
+- Anything explicitly marked "major" or "important" → major
+- Anything explicitly marked "minor" → minor
+- Anything explicitly marked "nit" → nit
+- For Claude output without explicit severity, default to "major"
+  conservatively (better to surface than to silently drop)
+
+For the Codex output, look for the literal severity strings under
+`### [Category Name]` headings:
+
+```bash
+parse_codex_severities() {
+    awk '
+        /^###/  { current_cat = $0; next }
+        /^- \\*\\*Severity:\\*\\* / {
+            sev = $0; sub(/^- \\*\\*Severity:\\*\\* /, "", sev);
+            # current_cat looks like "### 1) Behavioral Correctness"
+            # Extract the leading digit-group
+            n = match(current_cat, /[0-9]+/);
+            if (n) {
+                cat = substr(current_cat, RSTART, RLENGTH) + 0;
+            } else {
+                cat = 0;
+            }
+            print cat "\\t" sev;
+        }
+    ' "$1"
+}
+```
+
+Apply the rubric:
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+RISK_CLASS=$(echo "$NOTES" | grep -m1 '^risk_class:' | sed 's/^risk_class: //')
+REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+
+# Counts from Codex output (taxonomy-aware)
+BLOCKER_LOW=0   # cats 1-4
+BLOCKER_HIGH=0  # cats 5-8
+MAJOR=0         # cats 1-8
+
+if [ -s "$REPORT_DIR/codex.md" ]; then
+    while IFS=$'\\t' read -r cat sev; do
+        [ -z "$sev" ] && continue
+        case "$sev" in
+            blocker)
+                if [ "$cat" -ge 1 ] && [ "$cat" -le 4 ]; then
+                    BLOCKER_LOW=$((BLOCKER_LOW + 1))
+                elif [ "$cat" -ge 5 ] && [ "$cat" -le 8 ]; then
+                    BLOCKER_HIGH=$((BLOCKER_HIGH + 1))
+                fi
+                ;;
+            major)
+                if [ "$cat" -ge 1 ] && [ "$cat" -le 8 ]; then
+                    MAJOR=$((MAJOR + 1))
+                fi
+                ;;
+        esac
+    done < <(parse_codex_severities "$REPORT_DIR/codex.md")
+fi
+
+# Counts from Claude output (free-form, permissive)
+CLAUDE_BLOCKERS=0
+CLAUDE_MAJORS=0
+CLAUDE_FINDINGS=0
+if [ -s "$REPORT_DIR/claude.md" ]; then
+    CLAUDE_BLOCKERS=$(grep -ciE '(^|[^a-z])(blocker|BUG|critical)([^a-z]|$)' "$REPORT_DIR/claude.md" || true)
+    CLAUDE_MAJORS=$(grep -ciE '(^|[^a-z])(major|important)([^a-z]|$)' "$REPORT_DIR/claude.md" || true)
+    CLAUDE_FINDINGS=$(grep -cE '^[0-9]+\\. ' "$REPORT_DIR/claude.md" || true)
+fi
+
+ANY_REVIEWER_FINDINGS=0
+if [ "$BLOCKER_LOW" -gt 0 ] || [ "$BLOCKER_HIGH" -gt 0 ] || [ "$MAJOR" -gt 0 ] || \\
+   [ "$CLAUDE_BLOCKERS" -gt 0 ] || [ "$CLAUDE_MAJORS" -gt 0 ] || [ "$CLAUDE_FINDINGS" -gt 0 ]; then
+    ANY_REVIEWER_FINDINGS=1
+fi
+
+if [ "$BLOCKER_LOW" -gt 0 ] || [ "$CLAUDE_BLOCKERS" -gt 0 ]; then
+    VERDICT="block"
+elif [ "$BLOCKER_HIGH" -gt 0 ] || [ "$RISK_CLASS" = "high" ]; then
+    VERDICT="request_changes"
+elif [ "$MAJOR" -gt 0 ] || [ "$CLAUDE_MAJORS" -gt 0 ]; then
+    VERDICT="request_changes"
+elif [ "$RISK_CLASS" = "medium" ] && [ "$ANY_REVIEWER_FINDINGS" -gt 0 ]; then
+    VERDICT="request_changes"
+else
+    VERDICT="approve"
+fi
+
+bd update "$ROOT_ID" --notes "verdict: $VERDICT
+codex_blocker_low: $BLOCKER_LOW
+codex_blocker_high: $BLOCKER_HIGH
+codex_major: $MAJOR
+claude_blockers: $CLAUDE_BLOCKERS
+claude_majors: $CLAUDE_MAJORS
+claude_findings: $CLAUDE_FINDINGS"
+
+echo "[dual-review] verdict: $VERDICT"
+echo "[dual-review]   codex: blocker_low=$BLOCKER_LOW blocker_high=$BLOCKER_HIGH major=$MAJOR"
+echo "[dual-review]   claude: blockers=$CLAUDE_BLOCKERS majors=$CLAUDE_MAJORS findings=$CLAUDE_FINDINGS"
+echo "[dual-review]   risk_class: $RISK_CLASS"
+```
+
+Note: the `parse_codex_severities` helper is defined earlier in the
+step; pass it the codex report path. If Codex output omits the
+`Severity:` field on a finding (older prompt variant), that finding is
+silently skipped — accept the false-negative; the Claude path provides
+backstop coverage.
+
+**Exit criteria:** `verdict` is one of `{approve, request_changes,
+block}` and recorded on root bead notes alongside finding counts.
+"""
+
+[[steps]]
+id = "complete"
+title = "Write combined index and close the bead"
+needs = ["verdict"]
+description = """
+Write a combined index that links the three reports, record the
+verdict + risk class + report path on the root bead's notes, and close
+the bead so the polecat drains.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+PR_NUM=$(echo "$NOTES"  | grep -m1 '^pr:'           | sed 's/^pr: //')
+REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+VERDICT=$(echo "$NOTES"    | grep -m1 '^verdict:'     | sed 's/^verdict: //')
+RISK_CLASS=$(echo "$NOTES" | grep -m1 '^risk_class:'  | sed 's/^risk_class: //')
+
+cat > "$REPORT_DIR/dual-review.md" <<INDEXMD
+# Dual-review for PR #${PR_NUM}
+
+- **Verdict:** ${VERDICT}
+- **Risk class:** ${RISK_CLASS}
+
+## Reports
+
+- [Codex](codex.md)
+- [Claude](claude.md)
+- [Risk capstone](risk.md)
+INDEXMD
+
+bd update "$ROOT_ID" --notes "verdict: ${VERDICT}
+risk_class: ${RISK_CLASS}
+report_path: ${REPORT_DIR}/dual-review.md
+status: complete"
+
+bd close "$ROOT_ID" --reason "dual-review complete; verdict=${VERDICT} risk_class=${RISK_CLASS}"
+
+echo "[dual-review] complete"
+echo "[dual-review]   verdict: ${VERDICT}"
+echo "[dual-review]   risk_class: ${RISK_CLASS}"
+echo "[dual-review]   index: ${REPORT_DIR}/dual-review.md"
+```
+
+**Exit criteria:** `${REPORT_DIR}/dual-review.md` exists, root-bead
+notes record `verdict:`, `risk_class:`, `report_path:` pointing at the
+index, and `status: complete`; root bead is closed.
+"""

@@ -271,13 +271,48 @@ REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""' | grep -m1 '^repo
   but aren't in the impact surface>
 ```
 
-After writing, mark complete:
+After writing, classify the blast-radius risk and mark complete.
+
+Risk classification uses the count of bullet items under the report's
+`## Risks` heading as a proxy for surface area. The rubric:
+
+| Risk bullets in report | risk_class |
+|------------------------|------------|
+| 5 or more              | high       |
+| 2-4                    | medium     |
+| 0-1                    | low        |
+
+Callers (notably `mol-pr-dual-review`) read `risk_class` from the root
+bead's notes to gate or downgrade their verdict. The narrative `## Risks`
+section in the report remains the authoritative human-readable view.
 
 ```bash
-bd update "$ROOT_ID" --notes "status: complete"
+# Extract bullet lines under the "## Risks" heading, stopping at the
+# next "## " heading. Treat "-" and "*" as bullet markers.
+RISKS_SECTION=$(awk '/^## Risks[[:space:]]*$/{flag=1; next} /^## /{flag=0} flag' "$REPORT_PATH")
+HIGH_RISK_COUNT=$(echo "$RISKS_SECTION" | grep -cE '^[[:space:]]*[-*][[:space:]]' || true)
+
+if [ "$HIGH_RISK_COUNT" -ge 5 ]; then
+    RISK_CLASS="high"
+elif [ "$HIGH_RISK_COUNT" -ge 2 ]; then
+    RISK_CLASS="medium"
+else
+    RISK_CLASS="low"
+fi
+
+bd update "$ROOT_ID" --notes "risk_class: $RISK_CLASS
+risk_bullets: $HIGH_RISK_COUNT
+status: complete"
 echo "[blast-radius] Complete for: {{scope}}"
 echo "[blast-radius]   Path: $REPORT_PATH"
+echo "[blast-radius]   risk_class: $RISK_CLASS ($HIGH_RISK_COUNT bullets under ## Risks)"
 ```
 
-**Exit criteria:** Report written, root-bead notes finalized.
+If the report contains no `## Risks` heading, `RISKS_SECTION` is empty
+and `HIGH_RISK_COUNT` is 0, so `risk_class` falls through to `low`. That
+is the safe default — callers can still treat absent classification as
+informational.
+
+**Exit criteria:** Report written, `risk_class` recorded on root-bead
+notes, root-bead notes finalized.
 """

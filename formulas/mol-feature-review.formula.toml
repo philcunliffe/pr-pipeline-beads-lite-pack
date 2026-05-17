@@ -172,7 +172,7 @@ ID for the verdict read:
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
 # Capture sub-sling output; the wrapper prints the sub-bead ID.
-SUB_OUT=$(gc <rig>/pr-pipeline pr review {{pr}} 2>&1)
+SUB_OUT=$(gc <rig>/pr-pipeline pr dual-review {{pr}} 2>&1)
 SUB_BEAD=$(echo "$SUB_OUT" | grep -oE 'prblp-[a-z0-9]+' | tail -1)
 if [ -z "$SUB_BEAD" ]; then
     bd update "$ROOT_ID" --notes "status: blocked
