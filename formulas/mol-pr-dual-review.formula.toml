@@ -544,6 +544,10 @@ cross-reference table:
 BLAST_REPORT=$(bd show "$BLAST_BEAD" --json \\
     | jq -r '.[0].notes // ""' \\
     | grep -m1 '^report_path:' | sed 's/^report_path: //')
+
+# Record the blast-radius report path on root notes so the complete
+# step can inline its Risks section into the PR comment.
+bd update "$ROOT_ID" --notes "blast_radius_report: $BLAST_REPORT"
 ```
 
 Build the risk capstone report. Walk the reviewer reports for any
@@ -732,20 +736,24 @@ block}` and recorded on root bead notes alongside finding counts.
 
 [[steps]]
 id = "complete"
-title = "Write combined index and close the bead"
+title = "Write combined index, post summary on PR, close the bead"
 needs = ["verdict"]
 description = """
-Write a combined index that links the three reports, record the
-verdict + risk class + report path on the root bead's notes, and close
-the bead so the polecat drains.
+Write a combined index that links the three reports, post a summary
+comment on the PR so the verdict + risk class + report excerpts are
+visible to reviewers, record verdict + risk class + report path on the
+root bead's notes, and close the bead so the polecat drains.
 
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
-PR_NUM=$(echo "$NOTES"  | grep -m1 '^pr:'           | sed 's/^pr: //')
+PR_NUM=$(echo "$NOTES"     | grep -m1 '^pr:'          | sed 's/^pr: //')
+REPO=$(echo "$NOTES"       | grep -m1 '^repo:'        | sed 's/^repo: //')
 REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
 VERDICT=$(echo "$NOTES"    | grep -m1 '^verdict:'     | sed 's/^verdict: //')
 RISK_CLASS=$(echo "$NOTES" | grep -m1 '^risk_class:'  | sed 's/^risk_class: //')
+BLAST_BEAD=$(echo "$NOTES" | grep -m1 '^blast_radius_bead:' | sed 's/^blast_radius_bead: //')
+BLAST_REPORT=$(echo "$NOTES" | grep -m1 '^blast_radius_report:' | sed 's/^blast_radius_report: //')
 
 cat > "$REPORT_DIR/dual-review.md" <<INDEXMD
 # Dual-review for PR #${PR_NUM}
@@ -759,7 +767,89 @@ cat > "$REPORT_DIR/dual-review.md" <<INDEXMD
 - [Claude](claude.md)
 - [Risk capstone](risk.md)
 INDEXMD
+```
 
+Build the PR comment body. Inline reviewer + risk excerpts so reviewers
+don't have to chase filesystem paths. Be resilient to missing/empty
+report files — the verdict + risk class are authoritative on the bead
+notes; the inlined reports are best-effort.
+
+```bash
+COMMENT_BODY=$(mktemp -t pr-dual-review-comment.XXXXXX.md)
+
+# Topline
+{
+  printf '## Dual-agent review — `%s`\\n\\n' "$VERDICT"
+  printf '- **Verdict:** `%s`\\n' "$VERDICT"
+  printf '- **Risk class:** `%s`\\n' "$RISK_CLASS"
+  if [ -n "$BLAST_BEAD" ]; then
+    printf '- **Blast-radius bead:** `%s`\\n' "$BLAST_BEAD"
+  fi
+  printf '\\n'
+} > "$COMMENT_BODY"
+
+# Risk capstone excerpt (Risks section + cross-reference)
+if [ -f "$REPORT_DIR/risk.md" ] && [ -s "$REPORT_DIR/risk.md" ]; then
+  {
+    printf '### Risk capstone\\n\\n'
+    awk '/^## Cross-reference/{p=1} /^## Notes/{p=0} p' "$REPORT_DIR/risk.md" \\
+        | sed '/^$/N;/^\\n$/D'
+    printf '\\n'
+  } >> "$COMMENT_BODY"
+fi
+
+# Blast-radius Risks summary
+if [ -n "$BLAST_REPORT" ] && [ -f "$BLAST_REPORT" ]; then
+  {
+    printf '### Blast radius\\n\\n'
+    awk '/^## Risks/{p=1; next} /^## /{p=0} p' "$BLAST_REPORT" \\
+        | sed '/^$/N;/^\\n$/D'
+    printf '\\n'
+  } >> "$COMMENT_BODY"
+fi
+
+# Reviewer reports — only inline if non-empty.
+inline_report() {
+  local label="$1" path="$2"
+  if [ -f "$path" ] && [ -s "$path" ]; then
+    {
+      printf '<details><summary><b>%s review</b></summary>\\n\\n' "$label"
+      cat "$path"
+      printf '\\n</details>\\n\\n'
+    } >> "$COMMENT_BODY"
+  else
+    printf -- '- **%s review:** (no findings reported)\\n' "$label" >> "$COMMENT_BODY"
+  fi
+}
+inline_report Codex  "$REPORT_DIR/codex.md"
+inline_report Claude "$REPORT_DIR/claude.md"
+
+# Trailing reference line
+{
+  printf '\\n---\\n\\n'
+  printf 'Reports: `%s` · Bead: `%s`' "$REPORT_DIR" "$ROOT_ID"
+  [ -n "$BLAST_BEAD" ] && printf ' · Blast-radius: `%s`' "$BLAST_BEAD"
+  printf '\\n'
+} >> "$COMMENT_BODY"
+
+# Post the comment. Don't fail the bead if gh hits a transient error —
+# the verdict + report path are already recorded on the bead notes and
+# the index file is on disk.
+GH_REPO_FLAG=""
+[ -n "$REPO" ] && GH_REPO_FLAG="--repo $REPO"
+if gh pr comment "$PR_NUM" $GH_REPO_FLAG --body-file "$COMMENT_BODY" >/tmp/dual-review-comment-out 2>&1; then
+  COMMENT_URL=$(grep -m1 -oE 'https://github.com/[^[:space:]]+#issuecomment-[0-9]+' /tmp/dual-review-comment-out || true)
+  bd update "$ROOT_ID" --notes "pr_comment: ${COMMENT_URL:-posted}"
+else
+  bd update "$ROOT_ID" --notes "pr_comment: failed (see /tmp/dual-review-comment-out)"
+  echo "[dual-review] warning: gh pr comment failed; verdict still recorded" >&2
+fi
+rm -f "$COMMENT_BODY"
+```
+
+Record final state and close:
+
+```bash
 bd update "$ROOT_ID" --notes "verdict: ${VERDICT}
 risk_class: ${RISK_CLASS}
 report_path: ${REPORT_DIR}/dual-review.md
@@ -773,7 +863,16 @@ echo "[dual-review]   risk_class: ${RISK_CLASS}"
 echo "[dual-review]   index: ${REPORT_DIR}/dual-review.md"
 ```
 
-**Exit criteria:** `${REPORT_DIR}/dual-review.md` exists, root-bead
-notes record `verdict:`, `risk_class:`, `report_path:` pointing at the
-index, and `status: complete`; root bead is closed.
+**Exit criteria:** `${REPORT_DIR}/dual-review.md` exists, the dual-review
+summary comment was posted to PR #${PR_NUM} (or its failure recorded
+on the bead notes — non-fatal), root-bead notes record `verdict:`,
+`risk_class:`, `report_path:` pointing at the index, `pr_comment:`,
+and `status: complete`; root bead is closed.
+
+Callers of this formula (e.g. `mol-feature-review`, `mol-adopt-pr`)
+must **not** post their own dual-review summary comment — the
+combined-index post here is the canonical surface, and double-posting
+makes PR threads noisy. Callers may still post short status comments
+(merge announcements, conflict notices, etc.) that are not about the
+review itself.
 """
