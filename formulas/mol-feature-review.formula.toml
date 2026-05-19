@@ -1,15 +1,15 @@
 description = """
-Feature-review wrapper around `mol-pr-review` for the integration-branch
-flow. Runs the 11-category outgoing-PR scorecard against the draft PR
-that fronts an integration branch, reads the verdict the sub-formula
-records, and either marks the review approved or files a rollup fix
-bead against the integration branch.
+Feature-review wrapper around `mol-pr-dual-review` for the
+integration-branch flow. Runs the dual-agent review (Codex + Claude +
+risk capstone) against the draft PR that fronts an integration branch,
+reads the verdict the sub-formula records, and either marks the review
+approved or files a rollup fix bead against the integration branch.
 
 A coding agent (polecat or equivalent) runs this when a review bead is
 dispatched, either manually or by the gastown-beads-lite refinery's
-post-merge auto-routing (gb-RTR). The formula composes the existing
-outgoing-PR self-review and routes on its verdict — it does not
-re-implement the scorecard.
+post-merge auto-routing (gb-RTR). The formula composes the dual-review
+sub-formula and routes on its verdict — it does not re-implement the
+scorecard.
 
 ## Beads-Lite Command Note
 
@@ -34,8 +34,9 @@ the convention — it consumes it.
 1. Caller slings with `--var pr=<draft-PR-number>` and
    `--var integration_branch=<branch-name>`
 2. Agent works through 4 sequential steps
-3. Sub-formula `mol-pr-review` runs against the draft PR; its report is
-   written to `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>.md`
+3. Sub-formula `mol-pr-dual-review` runs against the draft PR; its
+   combined report index is written to
+   `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>/dual-review.md`
 4. Verdict (`approve` | `request_changes` | `block`) is read from the
    sub-formula bead's notes
 5. On `approve`: root bead notes record `verdict: approve` and
@@ -145,66 +146,58 @@ If any check fails: jump to the failure path described in `route`.
 
 [[steps]]
 id = "run-review"
-title = "Compose mol-pr-review against the draft PR"
+title = "Compose mol-pr-dual-review against the draft PR"
 description = """
-Run the existing outgoing-PR self-review against PR `{{pr}}`. The
-sub-formula writes its scorecard report to
-`${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}.md` and records its
-verdict (`approve` | `request_changes` | `block`) in the sub-formula
-bead's notes.
+Run the dual-agent outgoing-PR review (Codex + Claude + risk capstone)
+against PR `{{pr}}`. The sub-formula writes a combined report index to
+`${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}/dual-review.md` and
+records its verdict (`approve` | `request_changes` | `block`) in the
+sub-formula bead's notes.
 
-Prefer composition via sub-sling. The shape of the call depends on the
-caller environment; the canonical form is:
-
-```bash
-gc <rig>/pr-pipeline pr review {{pr}}
-```
-
-…or, equivalently, slinging the formula directly:
-
-```bash
-gc <rig>/pr-pipeline sling mol-pr-review --formula --var pr={{pr}}
-```
-
-Use whichever wrapper the rig exposes. Capture the sub-formula's bead
-ID for the verdict read:
+The sub-formula lives in the `pr-pipeline` rig. Invoke it via the
+cross-pack command wrapper — do **not** sling locally with `gc
+<local-rig> sling ...`, that creates an orphaned bead in the wrong
+rig's store. The single canonical call is:
 
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-# Capture sub-sling output; the wrapper prints the sub-bead ID.
+
+# Cross-pack sub-sling. The wrapper prints the new sub-bead's ID;
+# capture it for the verdict-read step. <rig> is the rig name the
+# caller is running under (e.g. azworld, gastown-beads-lite-pack).
 SUB_OUT=$(gc <rig>/pr-pipeline pr dual-review {{pr}} 2>&1)
 SUB_BEAD=$(echo "$SUB_OUT" | grep -oE 'prblp-[a-z0-9]+' | tail -1)
+
 if [ -z "$SUB_BEAD" ]; then
     bd update "$ROOT_ID" --notes "status: blocked
-failure: could not capture sub-bead from mol-pr-review"
-    # jump to failure path in `route`
+failure: could not capture sub-bead from mol-pr-dual-review (output: $SUB_OUT)"
     exit 1
 fi
 bd update "$ROOT_ID" --notes "sub_review_bead: $SUB_BEAD"
 ```
 
-If sub-slinging is not supported in the current pack infrastructure,
-inline the review logic by following `mol-pr-review`'s four steps
-directly (intake → scorecard → recurring-themes → produce-report).
-Write the report to the same `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}.md`
-path so the rest of this formula reads from a stable location. When
-inlining, record the verdict on the root bead's notes instead (skip
-the `SUB_BEAD` capture).
+Do not run any other review formula in this step — `mol-pr-review` is
+the legacy single-agent path and must not be slung here. Do not inline
+the review logic. If `gc <rig>/pr-pipeline pr dual-review` fails, jump
+to the failure path in `route`; do not fall back to a local sling or
+to the old single-agent formula.
 
 Compute and remember the report path:
 
 ```bash
 if [ -n "${GC_CITY_PATH:-}" ]; then
-    REPORT_PATH="${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}.md"
+    REPORT_PATH="${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}/dual-review.md"
 else
-    REPORT_PATH=".gc/pr-pipeline/reviews/pr-{{pr}}.md"
+    REPORT_PATH=".gc/pr-pipeline/reviews/pr-{{pr}}/dual-review.md"
 fi
 bd update "$ROOT_ID" --notes "review_report: $REPORT_PATH"
 ```
 
-**Exit criteria:** Sub-formula has run (or inline scorecard has
-completed), report file exists at the expected path, sub-bead ID (or
-verdict, if inlined) is recorded on the root bead.
+**Exit criteria:** Sub-formula has been slung cross-pack to the
+pr-pipeline rig and the resulting `prblp-*` bead ID is recorded on the
+root bead as `sub_review_bead`. Do **not** advance to verdict-read
+until the sub-bead is closed by the pr-pipeline polecat — the
+verdict-read step polls `bd show $SUB_BEAD` until status flips.
 
 If the sub-sling crashes: jump to the failure path in `route`.
 """
@@ -212,31 +205,61 @@ needs = ["intake"]
 
 [[steps]]
 id = "read-verdict"
-title = "Extract verdict from sub-formula notes"
+title = "Wait for sub-bead to close and extract its verdict"
 description = """
-The sub-formula records `verdict:` in its notes — one of `approve`,
-`request_changes`, or `block`. Read it:
+The sub-formula bead (`mol-pr-dual-review`, recorded as
+`sub_review_bead` on the root) runs asynchronously in the same rig's
+polecat pool. This step must poll until that sub-bead is closed, then
+read `verdict:` from its notes. One of `approve`, `request_changes`,
+or `block`.
+
+Do **not** read or invent a verdict from the root bead's own notes —
+the verdict only exists on the sub-bead. Do **not** time out and
+guess. If polling exceeds the budget below, jump to the failure path
+in `route`.
 
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
 SUB_BEAD=$(echo "$NOTES" | grep -m1 '^sub_review_bead:' | sed 's/^sub_review_bead: //')
 
-if [ -n "$SUB_BEAD" ]; then
-    # Sub-sling path: verdict is on the sub-bead.
-    VERDICT=$(bd show "$SUB_BEAD" --json | jq -r '.[0].notes // ""' \\
-        | grep -m1 '^verdict:' | sed 's/^verdict: //')
-else
-    # Inline path: verdict is on the root bead's own notes.
-    VERDICT=$(echo "$NOTES" | grep -m1 '^verdict:' | sed 's/^verdict: //')
+if [ -z "$SUB_BEAD" ]; then
+    bd update "$ROOT_ID" --notes "status: blocked
+failure: read-verdict reached without sub_review_bead on root notes"
+    exit 1
 fi
+
+# Poll the sub-bead until it closes. Dual-review can take 10-20 min in
+# the worst case (parallel Codex+Claude+blast-radius). Budget: 45 min.
+DEADLINE=$(( $(date +%s) + 45 * 60 ))
+while :; do
+    SUB_STATUS=$(bd show "$SUB_BEAD" --json | jq -r '.[0].status // ""')
+    case "$SUB_STATUS" in
+        closed) break ;;
+        open|in_progress)
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                bd update "$ROOT_ID" --notes "status: blocked
+failure: sub_review_bead $SUB_BEAD did not close within 45 minutes (last status: $SUB_STATUS)"
+                exit 1
+            fi
+            sleep 60
+            ;;
+        *)
+            bd update "$ROOT_ID" --notes "status: blocked
+failure: sub_review_bead $SUB_BEAD has unexpected status '$SUB_STATUS'"
+            exit 1
+            ;;
+    esac
+done
+
+VERDICT=$(bd show "$SUB_BEAD" --json | jq -r '.[0].notes // ""' \\
+    | grep -m1 '^verdict:' | sed 's/^verdict: //')
 
 case "$VERDICT" in
     approve|request_changes|block) ;;
     *)
         bd update "$ROOT_ID" --notes "status: blocked
-failure: could not parse verdict from review (saw: '$VERDICT')"
-        # jump to failure path in `route`
+failure: sub_review_bead $SUB_BEAD closed but no valid verdict in notes (saw: '$VERDICT')"
         exit 1
         ;;
 esac
@@ -244,8 +267,8 @@ esac
 bd update "$ROOT_ID" --notes "verdict: $VERDICT"
 ```
 
-**Exit criteria:** `verdict` is one of {approve, request_changes,
-block} and recorded on the root bead's notes.
+**Exit criteria:** Sub-bead is closed, `verdict` is one of {approve,
+request_changes, block}, and recorded on the root bead's notes.
 """
 needs = ["run-review"]
 
