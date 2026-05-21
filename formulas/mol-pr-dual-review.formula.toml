@@ -143,6 +143,31 @@ foreground using the `/code-review-quiet` skill (forked from the
 `code-review` plugin) with `--no-comment --output` so the structured
 comment body is written to a file instead of posted to GitHub.
 
+## Execution rule for this step (NO narration between tool calls)
+
+Every assistant turn in this step MUST end with a tool call. If you
+have nothing to add, your turn's text body should be empty and you
+should immediately invoke the next bash or Skill tool.
+
+This step has been observed to hang for hours at typed-but-unsubmitted
+prompts like "Now I'll continue with the formula" or "Both reviewers
+are done — proceeding to validate". Those phrases yield the turn back
+to the user under Claude Code's end-of-turn semantics, and the polecat
+session sits idle until externally nudged. Do not produce them.
+
+Specifically:
+
+- After the `/code-review-quiet` Skill returns, do NOT narrate. Go
+  straight to the `wait "$CODEX_PID"` Bash call below.
+- Between sequential bash blocks, do NOT pause to summarize. Run them
+  back-to-back as a chain of tool calls.
+- If you find yourself about to type "continue", "next", "now I'll",
+  "let me", "I'll proceed to", or any other transitional phrase —
+  delete it and call the tool directly.
+- If the formula step is complete and the next step's `needs` is
+  satisfied, return without narrating completion. The molecule advances
+  on its own.
+
 Read the values captured in `intake` from root-bead notes:
 
 ```bash
@@ -414,6 +439,12 @@ Then, in the same step, the polecat (running Claude) invokes the
 forked `code-review-quiet` skill in-process via the Skill tool with the
 arguments `<PR_NUM> --no-comment --output $REPORT_DIR/claude.md`. The
 skill is responsible for writing `$REPORT_DIR/claude.md`.
+
+**STOP-LOSS REMINDER.** This Skill return is the documented failure
+point for this step (see the no-narration rule at the top). The moment
+the Skill returns, your VERY NEXT action MUST be the Bash call below.
+Do NOT type "the Skill returned", "Claude finished", "now I'll wait on
+Codex", or any other text. Empty text body, immediate Bash tool call.
 
 After the skill returns, wait on Codex:
 
