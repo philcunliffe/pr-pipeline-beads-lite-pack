@@ -29,14 +29,21 @@ Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
 ## Contract
 
 1. Caller slings with `--var pr=<url-or-number>` (and optional
-   `--var integration_branch=<branch-name>`)
-2. Agent works through 5 sequential steps:
-   intake → dual-review → risk-capstone → verdict → complete
+   `--var integration_branch=<branch-name>`, `--var auto_fix=true`)
+2. Agent works through 6 sequential steps:
+   intake → dual-review → risk-capstone → verdict → file-fix-bead → complete
 3. Reports written to
    `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>/{codex.md,claude.md,risk.md,dual-review.md}`
 4. Root-bead notes record `verdict:`, `risk_class:`, and
    `report_path:` pointing at the combined index
-5. Agent exits — no fixes are applied
+5. When `auto_fix=true` AND verdict is `request_changes` or `block`,
+   the `file-fix-bead` step synthesizes a fix bead and slings it to
+   this rig's polecat pool. `fix_bead_id:` is recorded on root notes.
+   Default is `auto_fix=false` (no auto-filing) for backward
+   compatibility with callers like `mol-feature-review` that file
+   their own rollup fix beads.
+6. Agent exits — no code edits are applied here; the fix bead (if any)
+   carries the work to a polecat.
 
 ## Failure Modes
 
@@ -61,6 +68,14 @@ required = true
 [vars.integration_branch]
 description = "Optional integration branch label, recorded in notes for callers that want it surfaced"
 default = ""
+
+[vars.auto_fix]
+description = "When 'true' AND verdict is request_changes/block, the file-fix-bead step synthesizes a fix bead and slings it to this rig's polecat pool. Default 'false' so callers like mol-feature-review (which files its own rollup fix bead) don't get double-filing."
+default = "false"
+
+[vars.binding_prefix]
+description = "Pack binding prefix used for sling target naming (e.g. 'gastown-beads-lite.'). Only consulted by file-fix-bead."
+default = "gastown-beads-lite."
 
 [[steps]]
 id = "intake"
@@ -117,19 +132,26 @@ fi
 mkdir -p "$REPORT_DIR"
 ```
 
-Record initial state on the root bead:
+Record initial state on the root bead. Also persist the PR's head and
+base refs from the captured metadata — `file-fix-bead` (step 5) reads
+them to set the fix bead's `target` and `final_target` metadata.
 
 ```bash
+HEAD_REF=$(jq -r '.headRefName // ""' "/tmp/pr-$PR_NUM-metadata.json")
+BASE_REF=$(jq -r '.baseRefName // ""' "/tmp/pr-$PR_NUM-metadata.json")
+
 bd update "$ROOT_ID" --notes "pr: $PR_NUM
 repo: $REPO
 report_path: $REPORT_DIR
 integration_branch: {{integration_branch}}
+head_ref: $HEAD_REF
+base_ref: $BASE_REF
 status: in_progress"
 ```
 
 **Exit criteria:** PR metadata + diff + file list captured under
 `/tmp/`, `REPORT_DIR` exists, root-bead notes record `pr`, `repo`,
-`report_path`, and `status: in_progress`.
+`report_path`, `head_ref`, `base_ref`, and `status: in_progress`.
 """
 
 [[steps]]
@@ -766,9 +788,146 @@ block}` and recorded on root bead notes alongside finding counts.
 """
 
 [[steps]]
+id = "file-fix-bead"
+title = "(Optional) Synthesize a fix bead and sling it when changes are requested"
+needs = ["verdict"]
+description = """
+Conditional step: if `auto_fix=true` (caller opted in) AND the verdict
+is `request_changes` or `block`, synthesize a fix bead from the
+dual-review report and route it to this rig's polecat pool. The fix
+polecat reads the structured report files directly — the bead body
+just points to them and lists acceptance criteria.
+
+Skip silently when `auto_fix=false` (default) or when the verdict is
+`approve`. Callers like `mol-feature-review` that file their own
+rollup fix bead must leave `auto_fix=false` to avoid double-filing.
+
+```bash
+AUTO_FIX="{{auto_fix}}"
+if [ "$AUTO_FIX" != "true" ]; then
+    echo "[dual-review] auto_fix=$AUTO_FIX — skipping fix-bead synthesis"
+    exit 0
+fi
+
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+VERDICT=$(echo "$NOTES" | grep -m1 '^verdict:' | sed 's/^verdict: //')
+case "$VERDICT" in
+    request_changes|block) ;;
+    *)
+        echo "[dual-review] verdict=$VERDICT — no fix bead needed"
+        exit 0
+        ;;
+esac
+
+PR_NUM=$(echo "$NOTES"     | grep -m1 '^pr:'          | sed 's/^pr: //')
+REPO=$(echo "$NOTES"       | grep -m1 '^repo:'        | sed 's/^repo: //')
+REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+RISK_CLASS=$(echo "$NOTES" | grep -m1 '^risk_class:'  | sed 's/^risk_class: //')
+HEAD_REF=$(echo "$NOTES"   | grep -m1 '^head_ref:'    | sed 's/^head_ref: //')
+BASE_REF=$(echo "$NOTES"   | grep -m1 '^base_ref:'    | sed 's/^base_ref: //')
+
+if [ -z "$HEAD_REF" ] || [ -z "$BASE_REF" ]; then
+    echo "[dual-review] WARN: missing head_ref or base_ref in root notes; skipping fix-bead" >&2
+    bd update "$ROOT_ID" --notes "fix_bead_id: (skipped: missing branch refs)"
+    exit 0
+fi
+
+# Body intentionally brief — the fix polecat re-reads the report
+# files; do not duplicate findings inline (they could drift).
+FIX_BODY_FILE=$(mktemp -t fix-body.XXXXXX.md)
+cat > "$FIX_BODY_FILE" <<FIX_EOF
+The dual-review on PR #${PR_NUM} returned verdict \\`${VERDICT}\\` with
+risk_class=\\`${RISK_CLASS}\\`. Address every blocker and major finding
+with focused edits + tests on a polecat branch off \\`${HEAD_REF}\\`.
+
+## Reports to read
+
+- Combined index: ${REPORT_DIR}/dual-review.md
+- Codex findings: ${REPORT_DIR}/codex.md
+- Claude findings: ${REPORT_DIR}/claude.md
+- Risk capstone:   ${REPORT_DIR}/risk.md
+
+Read all four. The combined index links the rest; the per-reviewer
+files carry the structured findings with file:line evidence; the risk
+capstone marks which findings intersect high-blast-radius surfaces
+(prioritize those).
+
+## Acceptance
+
+- Every blocker and major finding addressed with a code edit + a test
+- New tests added for each finding; all existing tests still pass
+- Lint and typecheck clean (project-specific commands)
+- Commit messages reference the finding ("fix: <description> (codex N/M)")
+- Push the polecat branch and submit to refinery — do not merge
+  directly to \\`${HEAD_REF}\\` (refinery handles that)
+
+## References
+
+- Source dual-review bead: ${ROOT_ID}
+- Verdict: ${VERDICT} (risk_class=${RISK_CLASS})
+- PR: #${PR_NUM} on ${REPO}
+FIX_EOF
+
+FIX_TITLE="Fix dual-review findings on PR #${PR_NUM} (${VERDICT})"
+FIX_METADATA=$(jq -nc \\
+    --arg target "$HEAD_REF" \\
+    --arg final_target "$BASE_REF" \\
+    --arg pr "$PR_NUM" \\
+    --arg feature_phase "fix" \\
+    --arg source_review "$ROOT_ID" \\
+    '{target:$target, final_target:$final_target, pr:$pr, feature_phase:$feature_phase, source_review:$source_review}')
+
+FIX_ID=$(bd create "$FIX_TITLE" \\
+    --body-file "$FIX_BODY_FILE" \\
+    --metadata "$FIX_METADATA" \\
+    --json 2>/dev/null | jq -r '.id // .[0].id // empty')
+rm -f "$FIX_BODY_FILE"
+
+if [ -z "$FIX_ID" ] || [ "$FIX_ID" = "null" ]; then
+    echo "[dual-review] WARN: bd create returned no id for fix bead" >&2
+    bd update "$ROOT_ID" --notes "fix_bead_id: (creation failed)"
+    exit 0
+fi
+
+# Graph hygiene — fix bead is blocked-by the review root.
+bd dep add "$FIX_ID" --blocked-by "$ROOT_ID" 2>/dev/null || true
+
+# Sling to this rig's polecat pool. gc sling sets gc.routed_to and
+# creates an auto-convoy so the controller picks the bead up cleanly.
+SLING_TARGET="${GC_RIG:-}/{{binding_prefix}}polecat"
+if [ -z "$GC_RIG" ]; then
+    # Fall back to scraping rig from cwd if GC_RIG isn't set.
+    SLING_TARGET=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")/{{binding_prefix}}polecat
+fi
+
+if gc sling "$SLING_TARGET" "$FIX_ID" >/tmp/dual-review-sling.log 2>&1; then
+    bd update "$ROOT_ID" --notes "fix_bead_id: $FIX_ID
+fix_bead_routed_to: $SLING_TARGET"
+    echo "[dual-review] auto-filed fix bead $FIX_ID → $SLING_TARGET"
+else
+    echo "[dual-review] WARN: bd created $FIX_ID but gc sling to $SLING_TARGET failed (see /tmp/dual-review-sling.log)" >&2
+    # Still record the bead id — operator can re-sling manually.
+    bd update "$ROOT_ID" --notes "fix_bead_id: $FIX_ID
+fix_bead_routed_to: (sling failed)"
+fi
+```
+
+**Exit criteria:** One of:
+- `auto_fix != "true"` → skipped silently (no notes written)
+- Verdict is `approve` → skipped silently (no fix needed)
+- Fix bead created and routed → root notes record `fix_bead_id:` and
+  `fix_bead_routed_to:`
+- Fix bead created but sling failed → root notes record `fix_bead_id:`
+  and `fix_bead_routed_to: (sling failed)` — operator picks up manually
+- Bead creation failed → root notes record `fix_bead_id: (creation failed)`,
+  step exits 0 (do not fail the dual-review for fix-bead glitches)
+"""
+
+[[steps]]
 id = "complete"
 title = "Write combined index, post summary on PR, close the bead"
-needs = ["verdict"]
+needs = ["file-fix-bead"]
 description = """
 Write a combined index that links the three reports, post a summary
 comment on the PR so the verdict + risk class + report excerpts are
