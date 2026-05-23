@@ -36,7 +36,7 @@ To do this, follow these steps precisely:
 
 1. Use a Haiku agent to check if the pull request (a) is closed, (b) is a draft, (c) does not need a code review (eg. because it is an automated pull request, or is very simple and obviously ok), or (d) already has a code review from you from earlier. If so, do not proceed.
 
-   > Override for `--no-comment`: if `--no-comment` is set, skip the "(d) already has a code review from you" branch — the caller may legitimately want to re-run the review without posting. Branches (a), (b), and (c) still gate the run.
+   > Override for `--no-comment`: if `--no-comment` is set, skip branches (b), (c), and (d). The caller (typically `mol-pr-dual-review` or another orchestrator) is asserting it wants the review for its own purposes and will not post the result to GitHub, so the heuristic gates that exist to protect GitHub-visible noise no longer apply: (b) draft is the explicit use case for the dual-review pipeline running on `integration/*` PRs before ship-gate promotion; (c) "doesn't need a code review" defers to the orchestrator's judgment; (d) "already reviewed by me" stays overridden as before. Only branch (a) closed still gates — there is no point reviewing a closed PR even when output is being captured.
 
 2. Use another Haiku agent to give you a list of file paths to (but not the contents of) any relevant CLAUDE.md files from the codebase: the root CLAUDE.md file (if one exists), as well as any CLAUDE.md files in the directories whose files the pull request modified.
 
