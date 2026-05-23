@@ -359,8 +359,11 @@ CODEXROLE
 cat "$PROMPT_DIR/codex-role.md" "$CONTEXT_FILE" > "$PROMPT_DIR/codex-reviewer.md"
 ```
 
-Write the Codex PTY wrapper script (verbatim pattern from the
-`review-pr` skill — exec via `script -q -e -f -c`, NOT `-o`):
+Write the Codex PTY wrapper script. Prefers `aimux run codex …` when
+aimux is on PATH and falls back to direct `codex exec` when it isn't —
+output capture and the downstream ANSI/block parser are identical for
+both paths. Verbatim pattern from the `review-pr` skill — exec via
+`script -q -e -f -c`, NOT `-o`:
 
 ```bash
 cat > "$SCRIPT_DIR/codex-review.sh" <<'CODEXWRAP'
@@ -382,10 +385,16 @@ LOG_FILE=$(mktemp /tmp/codex-pty-XXXXXX.log)
 trap 'rm -f "$LOG_FILE"' EXIT
 
 CMD_FILE=$(mktemp /tmp/codex-cmd-XXXXXX.sh)
-# Codex reads the prompt from stdin when invoked with `-`; redirect the
-# prompt file into stdin. `unset CLAUDECODE` keeps Claude-related env
-# from leaking into the codex environment.
-printf 'unset CLAUDECODE; codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' - < %q\\n' "$PROMPT_FILE" > "$CMD_FILE"
+# Prefer aimux (better PTY handling + account isolation); fall back to
+# direct `codex exec` when aimux is not on PATH. Both paths feed into
+# the same `script -q -e -f -c` outer below so the downstream
+# ANSI/block parser is identical. `unset CLAUDECODE` keeps Claude-
+# related env from leaking into the codex environment.
+if command -v aimux >/dev/null 2>&1; then
+  printf 'unset CLAUDECODE; command cat %q | aimux run codex -m gpt-5.3-codex exec --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' -- -\\n' "$PROMPT_FILE" > "$CMD_FILE"
+else
+  printf 'unset CLAUDECODE; codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' - < %q\\n' "$PROMPT_FILE" > "$CMD_FILE"
+fi
 chmod +x "$CMD_FILE"
 
 timeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
@@ -434,7 +443,11 @@ else:
 ' "$LOG_FILE" > "$OUTPUT_FILE"
 
 if [[ ! -s "$OUTPUT_FILE" ]]; then
-  echo "ERROR: Codex produced empty output. Check that 'codex' is on PATH and the log tail below for runtime errors." >&2
+  if command -v aimux >/dev/null 2>&1; then
+    echo "ERROR: Codex produced empty output. Check aimux status (e.g. 'aimux status'); see log tail below." >&2
+  else
+    echo "ERROR: Codex produced empty output. aimux not on PATH; using direct codex exec failed. Check that 'codex' is on PATH and the log tail below." >&2
+  fi
   tail -50 "$LOG_FILE" >&2 || true
   exit 1
 fi
