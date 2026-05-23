@@ -202,8 +202,10 @@ REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //'
 
 ### Build the Codex prompt and PTY wrapper
 
-Write the Codex review prompt and the aimux PTY wrapper to a temp
-directory. The Codex review prompt is inlined here (sourced from
+Write the Codex review prompt and the Codex PTY wrapper to a temp
+directory. The wrapper invokes `codex exec` under `script -q -e -f -c`
+to give Codex a PTY (which it expects) and captures the output for
+the ANSI/block parser. The Codex review prompt is inlined here (sourced from
 `overlay/.claude/skills/review-pr/SKILL.md` in the `pr-review` pack,
 the canonical `codex-reviewer` prompt as of 2026-05). Factor out into a
 standalone skill in a follow-up when a second caller needs it.
@@ -361,10 +363,10 @@ Write the Codex PTY wrapper script (verbatim pattern from the
 `review-pr` skill — exec via `script -q -e -f -c`, NOT `-o`):
 
 ```bash
-cat > "$SCRIPT_DIR/aimux-codex.sh" <<'CODEXWRAP'
+cat > "$SCRIPT_DIR/codex-review.sh" <<'CODEXWRAP'
 #!/usr/bin/env bash
-# aimux-codex.sh — PTY-wrapped Codex invocation via aimux
-# Usage: aimux-codex.sh <prompt_file> <output_file> [timeout_seconds]
+# codex-review.sh — PTY-wrapped Codex invocation (via `script` + direct `codex exec`)
+# Usage: codex-review.sh <prompt_file> <output_file> [timeout_seconds]
 set -euo pipefail
 
 PROMPT_FILE="$1"
@@ -380,7 +382,10 @@ LOG_FILE=$(mktemp /tmp/codex-pty-XXXXXX.log)
 trap 'rm -f "$LOG_FILE"' EXIT
 
 CMD_FILE=$(mktemp /tmp/codex-cmd-XXXXXX.sh)
-printf 'unset CLAUDECODE; command cat %q | aimux run codex -m gpt-5.3-codex exec --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' -- -\\n' "$PROMPT_FILE" > "$CMD_FILE"
+# Codex reads the prompt from stdin when invoked with `-`; redirect the
+# prompt file into stdin. `unset CLAUDECODE` keeps Claude-related env
+# from leaking into the codex environment.
+printf 'unset CLAUDECODE; codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' - < %q\\n' "$PROMPT_FILE" > "$CMD_FILE"
 chmod +x "$CMD_FILE"
 
 timeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
@@ -429,18 +434,18 @@ else:
 ' "$LOG_FILE" > "$OUTPUT_FILE"
 
 if [[ ! -s "$OUTPUT_FILE" ]]; then
-  echo "ERROR: Codex produced empty output. Check aimux status." >&2
+  echo "ERROR: Codex produced empty output. Check that 'codex' is on PATH and the log tail below for runtime errors." >&2
   tail -50 "$LOG_FILE" >&2 || true
   exit 1
 fi
 CODEXWRAP
-chmod +x "$SCRIPT_DIR/aimux-codex.sh"
+chmod +x "$SCRIPT_DIR/codex-review.sh"
 ```
 
 > The doubled backslashes in the heredoc above are intentional: the
 > heredoc body becomes singly-escaped sequences in the written
-> `aimux-codex.sh` script, which Python then interprets as regex / ANSI
-> escapes. This mirrors the canonical wrapper in the `review-pr` skill.
+> `codex-review.sh` script, which Python then interprets as regex / ANSI
+> escapes.
 
 ### Launch both reviewers in parallel
 
@@ -450,7 +455,7 @@ structured body is written to a file instead of posted to GitHub.
 
 ```bash
 # Codex — background
-bash "$SCRIPT_DIR/aimux-codex.sh" \\
+bash "$SCRIPT_DIR/codex-review.sh" \\
     "$PROMPT_DIR/codex-reviewer.md" \\
     "$REPORT_DIR/codex.md" \\
     900 &
