@@ -33,10 +33,9 @@ Direct sling (skip this command):
 Output:
   Report at ${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>.md when
   GC_CITY_PATH is available; otherwise <repo-root>/.gc/pr-pipeline.
-  Root-bead notes record `verdict:` (block | request_changes | approve).
+  Root-bead notes record `verdict:` (request_changes | approve).
 
 Decision policy (mechanical):
-  Unresolved blocker in cat 1-4   → verdict block
-  Unresolved blocker in cat 5-8   → verdict request_changes
+  Unresolved blocker in any cat   → verdict request_changes
   Major in cat 1-8 unmitigated    → verdict request_changes
   Only minors / nits              → verdict approve

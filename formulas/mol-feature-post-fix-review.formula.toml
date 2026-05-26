@@ -1,0 +1,593 @@
+description = """
+Post-fix review and auto-merge advisory for the integration-branch feature
+flow.
+
+This formula runs after a rollup fix bead has been merged into the
+integration branch. It re-runs `mol-pr-dual-review` against the draft PR,
+records a conservative auto-merge advisory, and then either:
+
+1. files `mol-feature-ship` with the advisory metadata,
+2. files another capped fix bead for remaining request_changes findings,
+3. or records a thumbs-down advisory and stops for human triage.
+
+Current behavior is advisory only. No code path in this formula merges the
+integration PR.
+
+## Contract
+
+1. Caller slings with `--var pr=<draft-PR-number>` and
+   `--var integration_branch=<branch-name>`.
+2. The root bead has `metadata.feature_phase=post_fix_review`,
+   `metadata.source_fix_bead`, and `metadata.review_round`.
+3. The formula runs `mol-pr-dual-review` and reads `verdict:`,
+   `risk_class:`, and `report_path:` from the sub-bead notes.
+4. `approve` always progresses to ship, but only `approve` plus
+   `risk_class=low` receives `automerge_advisory=thumbs_up`.
+5. `request_changes` may file another fix only while
+   `review_round < max_review_rounds`; max-round exhaustion stops with
+   a thumbs-down advisory, mayor visibility, and a closed post-fix bead
+   so the flow does not loop. Operational failures still record
+   `status: blocked`/`failure:` and exit non-zero.
+"""
+formula = "mol-feature-post-fix-review"
+version = 1
+
+[vars]
+[vars.pr]
+description = "Draft PR number of the integration branch"
+required = true
+
+[vars.integration_branch]
+description = "Integration branch name"
+required = true
+
+[vars.max_review_rounds]
+description = "Maximum total dual-review rounds before post-fix failures stop for human triage. Initial review counts as round 1."
+default = "4"
+
+[vars.binding_prefix]
+description = "Pack binding prefix used to derive polecat/witness targets"
+default = "gastown-beads-lite."
+
+[vars.witness_target]
+description = "Qualified witness target. Empty means derive from $GC_RIG and binding_prefix."
+default = ""
+
+[vars.mayor_target]
+description = "Human-facing mayor mail target for terminal post-fix review stops."
+default = "gastown-beads-lite.mayor/"
+
+[[steps]]
+id = "intake"
+title = "Confirm post-fix review bead and draft PR"
+description = """
+Resolve the root bead, validate the feature-flow metadata, and confirm the
+draft PR still points at the integration branch.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
+ROOT_JSON=$(bd show "$ROOT_ID" --json)
+META=$(echo "$ROOT_JSON" | jq -c '.[0].metadata // {}')
+TARGET=$(echo "$META" | jq -r '.target // ""')
+PHASE=$(echo "$META" | jq -r '.feature_phase // ""')
+SOURCE_FIX_BEAD=$(echo "$META" | jq -r '.source_fix_bead // ""')
+REVIEW_ROUND=$(echo "$META" | jq -r '.review_round // "2"')
+MAX_REVIEW_ROUNDS="{{max_review_rounds}}"
+case "$REVIEW_ROUND" in ''|*[!0-9]*) REVIEW_ROUND=2 ;; esac
+case "$MAX_REVIEW_ROUNDS" in ''|*[!0-9]*) MAX_REVIEW_ROUNDS=4 ;; esac
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: not a git checkout"
+    exit 1
+}
+cd "$REPO_ROOT"
+
+WITNESS_TARGET="{{witness_target}}"
+if [ -z "$WITNESS_TARGET" ]; then
+    WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
+fi
+```
+
+Validate the bead shape:
+
+```bash
+if [ "$TARGET" != "{{integration_branch}}" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: target/integration_branch mismatch ($TARGET vs {{integration_branch}})"
+    exit 1
+fi
+if [ "$PHASE" != "post_fix_review" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: feature_phase is '$PHASE', expected 'post_fix_review'"
+    exit 1
+fi
+if [ -z "$SOURCE_FIX_BEAD" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: source_fix_bead metadata missing"
+    exit 1
+fi
+```
+
+Confirm the PR is still draft and headed by the integration branch:
+
+```bash
+PR_JSON=$(gh pr view {{pr}} --json state,isDraft,headRefName,url 2>/dev/null) || {
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: gh pr view {{pr}} failed"
+    exit 1
+}
+IS_DRAFT=$(echo "$PR_JSON" | jq -r '.isDraft')
+HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
+PR_URL=$(echo "$PR_JSON" | jq -r '.url')
+
+if [ "$IS_DRAFT" != "true" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: PR #{{pr}} is not draft (state=$PR_STATE isDraft=$IS_DRAFT)"
+    exit 1
+fi
+if [ "$HEAD_REF" != "{{integration_branch}}" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: PR #{{pr}} headRefName=$HEAD_REF does not match {{integration_branch}}"
+    exit 1
+fi
+
+bd update "$ROOT_ID" \\
+    --set-metadata post_fix_status=in_progress \\
+    --set-metadata post_fix_review_round="$REVIEW_ROUND" \\
+    --set-metadata post_fix_max_review_rounds="$MAX_REVIEW_ROUNDS" \\
+    --append-notes "post-fix-review: intake ok - PR #{{pr}} ($PR_URL), round $REVIEW_ROUND/$MAX_REVIEW_ROUNDS, source_fix_bead=$SOURCE_FIX_BEAD."
+```
+
+**Exit criteria:** Bead shape is valid, PR is draft, and review-round
+state is recorded in metadata.
+"""
+
+[[steps]]
+id = "run-review"
+title = "Run mol-pr-dual-review after the fix"
+needs = ["intake"]
+description = """
+Run the dual-agent review against the draft PR. Reuse an existing
+`sub_review_bead` on recovery so retries do not create duplicate reviews.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+RIG="${GC_RIG:-$(basename "$REPO_ROOT")}"
+
+if [ -n "${GC_CITY_PATH:-}" ]; then
+    REPORT_DIR="${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-{{pr}}"
+else
+    REPORT_DIR=".gc/pr-pipeline/reviews/pr-{{pr}}"
+fi
+REPORT_PATH="$REPORT_DIR/dual-review.md"
+
+extract_existing_bead_id() {
+    candidates=$(printf '%s\\n' "$1" | grep -oE '[a-z][a-z0-9]*-[a-z0-9]+' || true)
+    [ -n "$candidates" ] || return 0
+    printf '%s\\n' "$candidates" \\
+        | while IFS= read -r candidate; do
+            bd show "$candidate" --json >/dev/null 2>&1 && printf '%s\\n' "$candidate"
+          done \\
+        | tail -1
+}
+
+EXISTING_SUB=$(echo "$NOTES" | grep '^sub_review_bead:' | tail -1 | sed 's/^sub_review_bead: //')
+if [ -n "$EXISTING_SUB" ]; then
+    EXISTING_STATUS=$(bd show "$EXISTING_SUB" --json 2>/dev/null | jq -r '.[0].status // ""' || true)
+    case "$EXISTING_STATUS" in
+        closed|open|in_progress)
+            bd update "$ROOT_ID" --append-notes "sub_review_bead: $EXISTING_SUB
+review_report: $REPORT_PATH"
+            echo "[feature-post-fix-review] reusing sub_review_bead $EXISTING_SUB (status=$EXISTING_STATUS)"
+            exit 0
+            ;;
+    esac
+fi
+
+SUB_OUT=$(gc pr-pipeline pr dual-review {{pr}} --rig "$RIG" 2>&1)
+SUB_BEAD=$(extract_existing_bead_id "$SUB_OUT")
+
+if [ -z "$SUB_BEAD" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: could not capture sub-bead from mol-pr-dual-review (output: $SUB_OUT)"
+    exit 1
+fi
+
+bd update "$ROOT_ID" --append-notes "sub_review_bead: $SUB_BEAD
+review_report: $REPORT_PATH"
+```
+
+**Exit criteria:** A dual-review sub-bead exists and is recorded on the
+root bead as `sub_review_bead`.
+"""
+
+[[steps]]
+id = "read-verdict"
+title = "Wait for post-fix dual-review verdict"
+needs = ["run-review"]
+description = """
+Poll the sub-bead until it closes, then read the verdict, risk class, and
+report path from its notes.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+SUB_BEAD=$(echo "$NOTES" | grep '^sub_review_bead:' | tail -1 | sed 's/^sub_review_bead: //')
+REPORT_PATH=$(echo "$NOTES" | grep '^review_report:' | tail -1 | sed 's/^review_report: //')
+
+if [ -z "$SUB_BEAD" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: read-verdict reached without sub_review_bead on root notes"
+    exit 1
+fi
+
+DEADLINE=$(( $(date +%s) + 45 * 60 ))
+while :; do
+    SUB_JSON=$(bd show "$SUB_BEAD" --json)
+    SUB_STATUS=$(echo "$SUB_JSON" | jq -r '.[0].status // ""')
+    SUB_NOTES=$(echo "$SUB_JSON" | jq -r '.[0].notes // ""')
+    SUB_VERDICT=$(echo "$SUB_NOTES" | grep '^verdict:' | tail -1 | sed 's/^verdict: //' || true)
+    SUB_NOTE_STATUS=$(echo "$SUB_NOTES" | grep '^status:' | tail -1 | sed 's/^status: //' || true)
+    case "$SUB_STATUS" in
+        closed) break ;;
+        open|in_progress)
+            case "$SUB_VERDICT" in
+                approve|request_changes)
+                    if [ "$SUB_NOTE_STATUS" = "complete" ]; then
+                        echo "[feature-post-fix-review] accepting completed notes from $SUB_BEAD even though status=$SUB_STATUS"
+                        break
+                    fi
+                    ;;
+            esac
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                bd update "$ROOT_ID" --append-notes "status: blocked
+failure: sub_review_bead $SUB_BEAD did not close within 45 minutes (last status: $SUB_STATUS)"
+                exit 1
+            fi
+            sleep 60
+            ;;
+        *)
+            bd update "$ROOT_ID" --append-notes "status: blocked
+failure: sub_review_bead $SUB_BEAD has unexpected status '$SUB_STATUS'"
+            exit 1
+            ;;
+    esac
+done
+
+SUB_NOTES=$(bd show "$SUB_BEAD" --json | jq -r '.[0].notes // ""')
+VERDICT=$(echo "$SUB_NOTES" | grep '^verdict:' | tail -1 | sed 's/^verdict: //')
+RISK_CLASS=$(echo "$SUB_NOTES" | grep '^risk_class:' | tail -1 | sed 's/^risk_class: //' || true)
+SUB_REPORT_PATH=$(echo "$SUB_NOTES" | grep '^report_path:' | tail -1 | sed 's/^report_path: //' || true)
+[ -n "$SUB_REPORT_PATH" ] && REPORT_PATH="$SUB_REPORT_PATH"
+
+case "$VERDICT" in
+    approve|request_changes) ;;
+    *)
+        bd update "$ROOT_ID" --append-notes "status: blocked
+failure: sub_review_bead $SUB_BEAD closed but no valid verdict in notes (saw: '$VERDICT')"
+        exit 1
+        ;;
+esac
+case "$RISK_CLASS" in low|medium|high) ;; *) RISK_CLASS=unknown ;; esac
+
+bd update "$ROOT_ID" --append-notes "sub_review_bead: $SUB_BEAD
+verdict: $VERDICT
+risk_class: $RISK_CLASS
+review_report: $REPORT_PATH"
+```
+
+**Exit criteria:** Root notes contain `verdict:`, `risk_class:`, and
+`review_report:`.
+"""
+
+[[steps]]
+id = "route"
+title = "Record advisory, then ship, fix, or stop"
+needs = ["read-verdict"]
+description = """
+Compute the auto-merge advisory conservatively. Only a post-fix approve
+with low blast-radius risk earns thumbs up. Medium/high/unknown risk still
+ships for human review when the dual-review verdict is approve, but the
+auto-merge advisory is thumbs down.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
+ROOT_JSON=$(bd show "$ROOT_ID" --json)
+META=$(echo "$ROOT_JSON" | jq -c '.[0].metadata // {}')
+NOTES=$(echo "$ROOT_JSON" | jq -r '.[0].notes // ""')
+
+VERDICT=$(echo "$NOTES" | grep '^verdict:' | tail -1 | sed 's/^verdict: //')
+RISK_CLASS=$(echo "$NOTES" | grep '^risk_class:' | tail -1 | sed 's/^risk_class: //')
+REPORT_PATH=$(echo "$NOTES" | grep '^review_report:' | tail -1 | sed 's/^review_report: //')
+SUB_BEAD=$(echo "$NOTES" | grep '^sub_review_bead:' | tail -1 | sed 's/^sub_review_bead: //')
+
+SOURCE_FIX_BEAD=$(echo "$META" | jq -r '.source_fix_bead // ""')
+SOURCE_REVIEW_BEAD=$(echo "$META" | jq -r '.source_review_bead // ""')
+REVIEW_ROUND=$(echo "$META" | jq -r '.review_round // "2"')
+MAX_REVIEW_ROUNDS=$(echo "$META" | jq -r '.post_fix_max_review_rounds // "{{max_review_rounds}}"')
+FINAL_TARGET=$(echo "$META" | jq -r '.final_target // "main"')
+case "$REVIEW_ROUND" in ''|*[!0-9]*) REVIEW_ROUND=2 ;; esac
+case "$MAX_REVIEW_ROUNDS" in ''|*[!0-9]*) MAX_REVIEW_ROUNDS=4 ;; esac
+
+POLECAT_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+WITNESS_TARGET="{{witness_target}}"
+if [ -z "$WITNESS_TARGET" ]; then
+    WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
+fi
+
+AUTOMERGE_ADVISORY=thumbs_down
+AUTOMERGE_REASON="post-fix dual-review verdict is $VERDICT"
+if [ "$VERDICT" = "approve" ]; then
+    case "$RISK_CLASS" in
+        low)
+            AUTOMERGE_ADVISORY=thumbs_up
+            AUTOMERGE_REASON="post-fix dual-review approved and blast-radius risk is low"
+            ;;
+        medium|high)
+            AUTOMERGE_REASON="post-fix dual-review approved, but blast-radius risk is $RISK_CLASS"
+            ;;
+        *)
+            AUTOMERGE_REASON="post-fix dual-review approved, but blast-radius risk is unknown"
+            ;;
+    esac
+fi
+
+post_terminal_advisory_comment() {
+    local next_step="$1"
+    local body_file
+    local sub_pr_comment
+    sub_pr_comment=$(bd show "$SUB_BEAD" --json 2>/dev/null \\
+        | jq -r '.[0].notes // ""' \\
+        | grep '^pr_comment:' | tail -1 | sed 's/^pr_comment: //' || true)
+    case "$sub_pr_comment" in
+        http*|posted)
+            bd update "$ROOT_ID" \\
+                --set-metadata automerge_comment="$sub_pr_comment" \\
+                --set-metadata automerge_final_advisory=thumbs_down
+            echo "[feature-post-fix-review] reused dual-review PR comment: $sub_pr_comment"
+            return 0
+            ;;
+    esac
+
+    body_file=$(mktemp -t post-fix-advisory.XXXXXX.md)
+    {
+        printf '## Auto-merge advisory: THUMBS DOWN\\n\\n'
+        printf 'Current behavior: no auto-merge performed.\\n\\n'
+        printf '- **Decision:** not an auto-merge candidate after post-fix review\\n'
+        printf '- **Post-fix verdict:** `%s`\\n' "$VERDICT"
+        printf '- **Risk class:** `%s`\\n' "$RISK_CLASS"
+        printf '- **Review round:** `%s/%s`\\n' "$REVIEW_ROUND" "$MAX_REVIEW_ROUNDS"
+        printf '- **Reason:** %s\\n' "$AUTOMERGE_REASON"
+        printf '- **Next step:** %s\\n' "$next_step"
+        [ -n "$REPORT_PATH" ] && printf '- **Report:** `%s`\\n' "$REPORT_PATH"
+        [ -n "$SOURCE_FIX_BEAD" ] && printf '- **Source fix bead:** `%s`\\n' "$SOURCE_FIX_BEAD"
+    } > "$body_file"
+
+    if gh pr comment {{pr}} --body-file "$body_file" >/tmp/post-fix-advisory-comment-out 2>&1; then
+        COMMENT_URL=$(grep -m1 -oE 'https://github.com/[^[:space:]]+#issuecomment-[0-9]+' /tmp/post-fix-advisory-comment-out || true)
+        bd update "$ROOT_ID" \\
+            --set-metadata automerge_comment="${COMMENT_URL:-posted}" \\
+            --set-metadata automerge_final_advisory=thumbs_down
+    else
+        bd update "$ROOT_ID" \\
+            --set-metadata automerge_comment="failed (see /tmp/post-fix-advisory-comment-out)" \\
+            --set-metadata automerge_final_advisory=thumbs_down
+        echo "[feature-post-fix-review] warning: advisory comment failed; continuing with witness handoff" >&2
+    fi
+    rm -f "$body_file"
+}
+```
+
+### Approve path: file ship with advisory metadata
+
+```bash
+if [ "$VERDICT" = "approve" ]; then
+    SHIP_BODY_FILE=$(mktemp -t feature-ship-body.XXXXXX.md)
+    cat > "$SHIP_BODY_FILE" <<EOF
+Auto-filed by mol-feature-post-fix-review after post-fix dual-review for {{integration_branch}}.
+
+Auto-merge advisory before mechanical gates: $AUTOMERGE_ADVISORY
+Reason: $AUTOMERGE_REASON
+
+Run mol-feature-ship against draft PR #{{pr}}. On all-green, the formula
+marks the PR ready-for-review and posts the final auto-merge advisory
+comment. It does not auto-merge.
+EOF
+
+    SHIP_ID=$(bd create "Feature ship: {{integration_branch}}" \\
+        --description-file "$SHIP_BODY_FILE" --json \\
+        | jq -r '.id // .[0].id // empty')
+    rm -f "$SHIP_BODY_FILE"
+
+    if [ -z "$SHIP_ID" ] || [ "$SHIP_ID" = "null" ]; then
+        bd update "$ROOT_ID" \\
+            --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+            --set-metadata post_fix_status=blocked \\
+            --set-metadata blocked_reason="post-fix review could not file ship bead"
+        gc mail send "$WITNESS_TARGET" \\
+            -s "POST-FIX REVIEW FAILED: could not file ship bead for {{integration_branch}}" \\
+            -m "Post-fix review bead: $ROOT_ID
+Verdict: $VERDICT
+Risk class: $RISK_CLASS
+Advisory: $AUTOMERGE_ADVISORY
+Report: $REPORT_PATH"
+        exit 1
+    fi
+
+    bd update "$SHIP_ID" \\
+        --set-metadata target={{integration_branch}} \\
+        --set-metadata merge_strategy=integration \\
+        --set-metadata feature_phase=ship \\
+        --set-metadata formula=mol-feature-ship \\
+        --set-metadata pr={{pr}} \\
+        --set-metadata integration_branch={{integration_branch}} \\
+        --set-metadata final_target="$FINAL_TARGET" \\
+        --set-metadata gc.routed_to="$POLECAT_TARGET" \\
+        --set-metadata source_post_fix_review_bead="$ROOT_ID" \\
+        --set-metadata source_fix_bead="$SOURCE_FIX_BEAD" \\
+        --set-metadata automerge_advisory="$AUTOMERGE_ADVISORY" \\
+        --set-metadata automerge_advisory_reason="$AUTOMERGE_REASON" \\
+        --set-metadata automerge_review_verdict="$VERDICT" \\
+        --set-metadata automerge_risk_class="$RISK_CLASS" \\
+        --set-metadata automerge_review_round="$REVIEW_ROUND" \\
+        --set-metadata automerge_report_path="$REPORT_PATH"
+    if [ -n "$SOURCE_REVIEW_BEAD" ]; then
+        bd update "$SHIP_ID" --set-metadata source_review_bead="$SOURCE_REVIEW_BEAD"
+    fi
+
+    bd update "$ROOT_ID" --notes "sub_review_bead: $SUB_BEAD
+verdict: $VERDICT
+risk_class: $RISK_CLASS
+review_report: $REPORT_PATH
+automerge_advisory: $AUTOMERGE_ADVISORY
+automerge_advisory_reason: $AUTOMERGE_REASON
+ship_bead_id: $SHIP_ID
+status: complete"
+    bd close "$ROOT_ID" --reason "post-fix review approved; advisory=$AUTOMERGE_ADVISORY; filed ship bead $SHIP_ID"
+
+    gc sling "$POLECAT_TARGET" "$SHIP_ID" --nudge || {
+        gc mail send "$WITNESS_TARGET" \\
+            -s "POST-FIX REVIEW: could not sling ship bead $SHIP_ID for {{integration_branch}}" \\
+            -m "Post-fix review bead: $ROOT_ID
+Ship bead: $SHIP_ID
+Advisory: $AUTOMERGE_ADVISORY
+
+The ship bead has gc.routed_to metadata but gc sling failed. Manual recovery: route $SHIP_ID to $POLECAT_TARGET."
+        exit 1
+    }
+
+    echo "[feature-post-fix-review] approved - filed ship bead $SHIP_ID with advisory=$AUTOMERGE_ADVISORY"
+    exit 0
+fi
+```
+
+### Request-changes path: capped second fix, otherwise stop
+
+```bash
+if [ "$VERDICT" = "request_changes" ] && [ "$REVIEW_ROUND" -lt "$MAX_REVIEW_ROUNDS" ]; then
+    FIX_BODY_FILE=$(mktemp -t post-fix-body.XXXXXX.md)
+    {
+        printf '# Fix post-fix review findings for {{integration_branch}}\\n\\n'
+        printf 'The post-fix dual-review on PR #{{pr}} returned verdict: `%s` with risk_class=`%s`.\\n\\n' "$VERDICT" "$RISK_CLASS"
+        printf 'Review round: %s/%s\\n\\n' "$REVIEW_ROUND" "$MAX_REVIEW_ROUNDS"
+        printf '## Report\\n\\n'
+        printf 'Full report path: `%s`\\n\\n' "$REPORT_PATH"
+        printf '## Findings to address\\n\\n'
+        if [ -f "$REPORT_PATH" ]; then
+            cat "$REPORT_PATH"
+        else
+            printf '(report file not found at %s - see sub-formula bead %s notes)\\n' "$REPORT_PATH" "$SUB_BEAD"
+        fi
+        printf '\\n## Workflow\\n\\n'
+        printf '- Branch off origin/{{integration_branch}}.\\n'
+        printf '- Address every blocker and major finding above.\\n'
+        printf '- Refinery merges the fix, then routes another post-fix review round.\\n'
+    } > "$FIX_BODY_FILE"
+
+    FIX_ID=$(bd create "Fix post-fix review findings: {{integration_branch}}" \\
+        --description-file "$FIX_BODY_FILE" --json \\
+        | jq -r '.id // .[0].id // empty')
+    rm -f "$FIX_BODY_FILE"
+
+    if [ -z "$FIX_ID" ] || [ "$FIX_ID" = "null" ]; then
+        bd update "$ROOT_ID" --append-notes "status: blocked
+failure: bd create returned no id for post-fix fix bead"
+        exit 1
+    fi
+
+    bd update "$FIX_ID" \\
+        --set-metadata target={{integration_branch}} \\
+        --set-metadata feature_phase=fix \\
+        --set-metadata formula=mol-feature-polecat-work \\
+        --set-metadata merge_strategy=integration \\
+        --set-metadata gc.routed_to="$POLECAT_TARGET" \\
+        --set-metadata pr={{pr}} \\
+        --set-metadata review_round="$REVIEW_ROUND" \\
+        --set-metadata source_post_fix_review_bead="$ROOT_ID" \\
+        --set-metadata source_fix_bead="$SOURCE_FIX_BEAD"
+    if [ -n "$SOURCE_REVIEW_BEAD" ]; then
+        bd update "$FIX_ID" --set-metadata source_review_bead="$SOURCE_REVIEW_BEAD"
+    fi
+
+    bd dep add "$FIX_ID" --blocked-by "$ROOT_ID" || true
+
+    bd update "$ROOT_ID" --notes "sub_review_bead: $SUB_BEAD
+verdict: $VERDICT
+risk_class: $RISK_CLASS
+review_report: $REPORT_PATH
+automerge_advisory: thumbs_down
+fix_bead_id: $FIX_ID
+status: complete"
+    bd close "$ROOT_ID" --reason "post-fix review request_changes; filed fix bead $FIX_ID"
+
+    gc sling "$POLECAT_TARGET" "$FIX_ID" --nudge || {
+        gc mail send "$WITNESS_TARGET" \\
+            -s "POST-FIX REVIEW: could not sling fix bead $FIX_ID for {{integration_branch}}" \\
+            -m "Post-fix review bead: $ROOT_ID
+Fix bead: $FIX_ID
+
+The fix bead has gc.routed_to metadata but gc sling failed. Manual recovery: route $FIX_ID to $POLECAT_TARGET."
+        exit 1
+    }
+
+    echo "[feature-post-fix-review] request_changes - filed capped follow-up fix bead $FIX_ID"
+    exit 0
+fi
+```
+
+### Terminal thumbs-down path
+
+```bash
+case "$VERDICT" in
+    request_changes)
+        NEXT_STEP="human triage required because max_review_rounds=$MAX_REVIEW_ROUNDS was reached"
+        ;;
+    *)
+        NEXT_STEP="human triage required because post-fix review did not produce an approvable result"
+        ;;
+esac
+
+post_terminal_advisory_comment "$NEXT_STEP"
+ROOT_AUTOMERGE_COMMENT=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.automerge_comment // ""')
+
+bd update "$ROOT_ID" \\
+    --set-metadata gc.routed_to="$WITNESS_TARGET" \\
+    --set-metadata post_fix_status=blocked \\
+    --set-metadata automerge_advisory=thumbs_down \\
+    --set-metadata automerge_advisory_reason="$AUTOMERGE_REASON" \\
+    --set-metadata automerge_review_verdict="$VERDICT" \\
+    --set-metadata automerge_risk_class="$RISK_CLASS" \\
+    --set-metadata automerge_review_round="$REVIEW_ROUND" \\
+    --append-notes "post-fix-review: THUMBS DOWN - $NEXT_STEP"
+
+gc mail send "{{mayor_target}}" \\
+    -s "POST-FIX REVIEW STOPPED: PR #{{pr}} for {{integration_branch}}" \\
+    -m "Post-fix review stopped for {{integration_branch}}.
+
+Bead: $ROOT_ID
+Verdict: $VERDICT
+Risk class: $RISK_CLASS
+Review round: $REVIEW_ROUND/$MAX_REVIEW_ROUNDS
+Reason: $AUTOMERGE_REASON
+Report: $REPORT_PATH
+PR comment: $ROOT_AUTOMERGE_COMMENT
+
+$NEXT_STEP."
+
+bd close "$ROOT_ID" --reason "post-fix review stopped; advisory=thumbs_down; $NEXT_STEP"
+
+echo "[feature-post-fix-review] THUMBS DOWN - mayor notified. $NEXT_STEP"
+exit 0
+```
+
+**Exit criteria:**
+- `approve` -> ship bead exists with advisory metadata and is slung.
+- `request_changes` under the round cap -> follow-up fix bead exists and is slung.
+- Max-round exhaustion -> PR has or reuses a thumbs-down advisory
+  comment; root bead is closed with `post_fix_status=blocked` and mayor
+  is notified for human triage.
+"""

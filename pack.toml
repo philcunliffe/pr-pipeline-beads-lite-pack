@@ -5,12 +5,15 @@
 # that imports this pack gets the same discipline as platform-native
 # formulas and commands.
 #
-# v0.1.0 ships five formulas + four wrapper commands:
+# v0.1.0 ships PR pipeline formulas + wrapper commands, including:
 #   - mol-pr-start          author-side issue → plan workflow
 #   - mol-pr-blast-radius   composable impact-surface mapping
 #   - mol-pr-triage         gascity issue triage report; direct sling only
 #   - mol-pr-review         outgoing-PR self-review (11-category scorecard)
+#   - mol-pr-dual-review    dual-agent outgoing-PR review + risk capstone
 #   - mol-pr-ship           pre-push gate (simplify → review → check)
+#   - mol-feature-*         integration-branch feature flow, including
+#                            post-fix review/advisory before ship
 #
 # Sibling pack `pr-review` covers the maintainer-side incoming-PR
 # review/merge workflow (`mol-adopt-pr`); this pack focuses on the

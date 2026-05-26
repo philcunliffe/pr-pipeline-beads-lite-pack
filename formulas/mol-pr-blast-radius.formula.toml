@@ -63,7 +63,7 @@ Confirm we're in a git repo and parse the scope into a list of analyzable
 targets.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot map blast radius."
     bd close "$ROOT_ID" --reason "not a git checkout"
@@ -225,8 +225,8 @@ description = """
 Write the report to `$REPORT_PATH` using this structure:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
+REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r 'if type == "array" then (.[0].notes // "") else (.notes // "") end' | grep '^report_path:' | tail -1 | sed 's/^report_path: //')
 ```
 
 ```markdown
@@ -300,7 +300,7 @@ else
     RISK_CLASS="low"
 fi
 
-bd update "$ROOT_ID" --notes "risk_class: $RISK_CLASS
+bd update "$ROOT_ID" --append-notes "risk_class: $RISK_CLASS
 risk_bullets: $HIGH_RISK_COUNT
 status: complete"
 echo "[blast-radius] Complete for: {{scope}}"

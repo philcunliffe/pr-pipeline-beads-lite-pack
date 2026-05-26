@@ -626,8 +626,8 @@ needs = ["merge"]
 description = """
 After a per-bead merge succeeds, decide whether this was the last merge for
 the integration branch (`$TARGET`). If so, file the next bead in the
-autonomous feature flow — review, ship, or fix-rollup — so the loop advances
-without a human. If sibling beads are still open, this step is a no-op.
+autonomous feature flow: review, post-fix review, or ship. If sibling beads
+are still open, this step is a no-op.
 
 Beads outside the feature flow (no `metadata.feature_phase` set) skip
 routing entirely.
@@ -728,9 +728,9 @@ case "$PHASE" in
 "Auto-filed by gb-RTR after the final work-bead merged for $TARGET.
 
 Run the outgoing-PR scorecard against draft PR #$PR (head: $TARGET).
-On approve, gb-RTR files the ship bead. On request_changes or block,
-mol-feature-review files a rollup fix bead targeting $TARGET — and once
-that fix merges, gb-RTR fires again to file the ship bead." \
+On approve, mol-feature-review files the ship bead. On request_changes,
+mol-feature-review files a rollup fix bead targeting $TARGET;
+after that fix merges, gb-RTR files a post-fix review/advisory bead." \
               || ROUTE_ERR="bd create failed for review bead (phase=work)"
         fi
         ;;
@@ -738,7 +738,7 @@ that fix merges, gb-RTR fires again to file the ship bead." \
 
 ### `review` → file ship bead (only on `approve` verdict)
 
-`mol-feature-review` writes `verdict: <approve|request_changes|block>` into
+`mol-feature-review` writes `verdict: <approve|request_changes>` into
 the review bead's notes. On non-approve, that formula has already filed
 the rollup fix bead, so routing has nothing to do.
 
@@ -760,7 +760,7 @@ flips the draft PR to ready-for-review (gh pr ready)." \
                       || ROUTE_ERR="bd create failed for ship bead (phase=review approve)"
                 fi
                 ;;
-            request_changes|block)
+            request_changes)
                 echo "post-merge-route: review verdict=$VERDICT — mol-feature-review filed the rollup fix bead; nothing to route."
                 ;;
             "")
@@ -773,22 +773,49 @@ flips the draft PR to ready-for-review (gh pr ready)." \
         ;;
 ```
 
-### `fix` → file ship bead (no re-review)
+### `fix` → file post-fix review/advisory bead
 
-Per gb-RTR spec, the rollup fix is not re-reviewed; it goes straight to
-ship.
+After each rollup fix lands, run another dual-review pass before the PR is
+eligible for ship. That post-fix review records an auto-merge advisory
+and either files ship, files another capped fix cycle, or stops for
+human triage when the configured review-round cap is reached.
 
 ```bash
     fix)
-        EXISTING=$(next_phase_bead_exists "$TARGET" ship)
+        EXISTING=$(next_phase_bead_exists "$TARGET" post_fix_review)
         if [ -n "$EXISTING" ]; then
-            echo "post-merge-route: ship bead $EXISTING already exists for $TARGET; skipping (idempotent)."
+            echo "post-merge-route: post-fix review bead $EXISTING already exists for $TARGET; skipping (idempotent)."
         else
-            write_next_bead "Feature ship: $TARGET" ship mol-feature-ship \
-"Auto-filed by gb-RTR after the rollup fix merged for $TARGET.
+            FIX_META=$(bd show "$WORK" --json | jq -c '.[0].metadata // {}')
+            SOURCE_REVIEW_BEAD=$(echo "$FIX_META" | jq -r '.source_review_bead // ""')
+            SOURCE_POST_FIX_REVIEW_BEAD=$(echo "$FIX_META" | jq -r '.source_post_fix_review_bead // ""')
+            LAST_REVIEW_ROUND=$(echo "$FIX_META" | jq -r '.review_round // "1"')
+            case "$LAST_REVIEW_ROUND" in
+                ''|*[!0-9]*) LAST_REVIEW_ROUND=1 ;;
+            esac
+            NEXT_REVIEW_ROUND=$((LAST_REVIEW_ROUND + 1))
 
-Per spec, no re-review runs. Run mol-feature-ship against draft PR #$PR." \
-              || ROUTE_ERR="bd create failed for ship bead (phase=fix)"
+            write_next_bead "Post-fix review: $TARGET" post_fix_review mol-feature-post-fix-review \
+"Auto-filed by gb-RTR after a rollup fix merged for $TARGET.
+
+Run mol-feature-post-fix-review against draft PR #$PR (head: $TARGET).
+This re-runs the dual-review after the fix and records an auto-merge
+advisory. On acceptable review results it files mol-feature-ship; on
+remaining review blockers it files another capped fix cycle until the
+configured review-round cap is reached." \
+              || ROUTE_ERR="bd create failed for post-fix review bead (phase=fix)"
+
+            if [ -n "$NEW_BEAD" ]; then
+                bd update "$NEW_BEAD" \
+                  --set-metadata source_fix_bead="$WORK" \
+                  --set-metadata review_round="$NEXT_REVIEW_ROUND"
+                if [ -n "$SOURCE_REVIEW_BEAD" ]; then
+                    bd update "$NEW_BEAD" --set-metadata source_review_bead="$SOURCE_REVIEW_BEAD"
+                fi
+                if [ -n "$SOURCE_POST_FIX_REVIEW_BEAD" ]; then
+                    bd update "$NEW_BEAD" --set-metadata previous_post_fix_review_bead="$SOURCE_POST_FIX_REVIEW_BEAD"
+                fi
+            fi
         fi
         ;;
 ```

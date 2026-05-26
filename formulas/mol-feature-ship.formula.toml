@@ -5,9 +5,11 @@ followed by a human-only hand-off.
 Runs build / vet / lint / test / docs against the integration branch. On
 all-green: marks the draft PR ready-for-review via `gh pr ready`. On any
 red: mails the rig witness with a truncated failure summary and marks the
-root bead blocked. **No auto-merge** — the `gh pr ready` call is the single
-hand-off point to the human. After that, GitHub's normal review/merge flow
-takes over.
+root bead blocked. When a post-fix review supplied auto-merge advisory
+metadata, this formula posts the final thumbs-up/down PR comment after the
+mechanical gates are known. **No auto-merge** — the `gh pr ready` call is
+the single hand-off point to the human. After that, GitHub's normal
+review/merge flow takes over.
 
 This formula reuses the mechanical-gates concept from `mol-pr-ship`'s
 contributor-check stage but deliberately skips simplify and review-iterate:
@@ -31,10 +33,12 @@ Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
 3. Agent runs every applicable mechanical gate (does NOT short-circuit on
    the first failure — the failure summary needs to be complete).
 4. On all-green: `gh pr ready <pr>`; metadata `ship_status=complete` and
-   `ship_pr_status=ready_for_review`; the root bead is closed.
+   `ship_pr_status=ready_for_review`; if advisory metadata exists, post the
+   final auto-merge advisory comment; the root bead is closed.
 5. On any red: witness mail sent with truncated per-gate logs; metadata
    `ship_status=blocked` and `gc.routed_to` set to the rig witness so the
-   witness session can pick the bead up.
+   witness session can pick the bead up. If advisory metadata exists, post
+   a final thumbs-down advisory comment.
 6. **Do NOT auto-file a fix bead.** Gate failures here are usually
    environmental (CI flake, missing tool, build infra) and need human
    judgment — auto-firing a polecat would just chase its tail.
@@ -90,7 +94,7 @@ notes block, so any state the route step needs must live in metadata, not
 notes.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "[feature-ship] BLOCKED — not in a git repository."
     bd update "$ROOT_ID" \\
@@ -226,7 +230,7 @@ witness mail. The result directory is recorded on the bead so the route
 step can find it.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 GATES_PASSED=""
 GATES_FAILED=""
 RESULT_DIR=$(mktemp -d -t feature-ship-{{pr}}-XXXXXX)
@@ -451,9 +455,114 @@ for the route step.
 """
 
 [[steps]]
+id = "update-pr-description"
+title = "Generate diff-aware PR description (green path only)"
+needs = ["mechanical-gates"]
+description = """
+Read the gate results from metadata. If gates failed (or no gates ran),
+skip this step entirely — the route step will handle the red path. If
+gates passed, generate a comprehensive PR description from the actual
+diff and completed work beads, then update the PR body via `gh pr edit`.
+
+This runs before the route step so the human sees a useful description
+when the PR lands in their review queue.
+
+```bash
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
+META=$(bd show "$ROOT_ID" --json | jq -c '.[0].metadata')
+GATES_PASSED=$(echo "$META" | jq -r '.ship_gates_passed // ""')
+GATES_FAILED=$(echo "$META" | jq -r '.ship_gates_failed // ""')
+
+GF_TRIMMED=$(echo "$GATES_FAILED" | tr -d ' ')
+GP_TRIMMED=$(echo "$GATES_PASSED" | tr -d ' ')
+
+if [ -n "$GF_TRIMMED" ] || [ -z "$GP_TRIMMED" ]; then
+    echo "[feature-ship] Gates not green — skipping PR description update."
+    exit 0
+fi
+```
+
+### Collect diff information
+
+```bash
+DIFF_STAT=$(gh pr diff {{pr}} --stat 2>/dev/null | tail -30 || echo "(diff stats unavailable)")
+FILE_LIST=$(gh pr diff {{pr}} --name-only 2>/dev/null || echo "")
+FILE_COUNT=$(echo "$FILE_LIST" | grep -c '.' 2>/dev/null || echo 0)
+```
+
+### Collect completed work bead summaries
+
+Query closed work beads targeting this integration branch. Extract the
+title (stripped of the "Feature <slug>:" prefix) and close reason.
+
+```bash
+BEAD_LINES=$(bd list --status closed --json 2>/dev/null \\
+    | jq -r --arg target "{{integration_branch}}" '
+        [.[] | select(.metadata.target == $target and .metadata.feature_phase == "work")]
+        | sort_by(.created_at)
+        | .[]
+        | "- **\\(.title | sub("^Feature [^:]+: "; ""))**: \\(.close_reason // "completed")"
+    ' 2>/dev/null || echo "- (bead summary unavailable)")
+```
+
+### Build and apply the PR description
+
+```bash
+PR_DESC_FILE=$(mktemp -t feature-ship-pr-desc.XXXXXX.md)
+cat > "$PR_DESC_FILE" <<'DESCEOF'
+## Summary
+
+DESCEOF
+
+echo "$BEAD_LINES" >> "$PR_DESC_FILE"
+
+cat >> "$PR_DESC_FILE" <<DESCEOF
+
+## Changes
+
+$FILE_COUNT files changed on \`{{integration_branch}}\`.
+
+<details>
+<summary>Diff stats</summary>
+
+\`\`\`
+$DIFF_STAT
+\`\`\`
+
+</details>
+
+<details>
+<summary>Files changed</summary>
+
+\`\`\`
+$FILE_LIST
+\`\`\`
+
+</details>
+
+---
+*Description generated by \`mol-feature-ship\` from the integration branch diff and completed work beads.*
+DESCEOF
+
+if gh pr edit {{pr}} --body-file "$PR_DESC_FILE" 2>/dev/null; then
+    echo "[feature-ship] PR #{{pr}} description updated from diff + bead history."
+    bd update "$ROOT_ID" \\
+        --append-notes "feature-ship: PR description updated from diff ($FILE_COUNT files changed)."
+else
+    echo "[feature-ship] WARNING: could not update PR description (non-fatal, continuing)."
+fi
+rm -f "$PR_DESC_FILE"
+```
+
+**Exit criteria:** PR description updated with diff-aware summary, or a
+non-fatal warning logged if the update failed. Either way, the route step
+proceeds.
+"""
+
+[[steps]]
 id = "route"
 title = "Route to ready-for-review (green) or witness (red)"
-needs = ["mechanical-gates"]
+needs = ["update-pr-description"]
 description = """
 Branch on the collected gate results. **No auto-merge, no auto-fix bead.**
 Either mark the PR ready for human review, or mail the witness with a
@@ -465,7 +574,7 @@ deterministically — grep'ing freetext notes is unsafe because `--notes`
 overwrites and other updates may have happened between steps.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 META=$(bd show "$ROOT_ID" --json | jq -c '.[0].metadata')
 GATES_PASSED=$(echo "$META" | jq -r '.ship_gates_passed // ""')
 GATES_FAILED=$(echo "$META" | jq -r '.ship_gates_failed // ""')
@@ -473,6 +582,59 @@ GATES_DETAIL=$(echo "$META" | jq -r '.ship_gates_detail // ""')
 RESULT_DIR=$(echo "$META" | jq -r '.ship_result_dir // ""')
 WITNESS_TARGET=$(echo "$META" | jq -r '.ship_witness_target // ""')
 PR_URL=$(echo "$META" | jq -r '.ship_pr_url // ""')
+AUTOMERGE_ADVISORY=$(echo "$META" | jq -r '.automerge_advisory // ""')
+AUTOMERGE_REASON=$(echo "$META" | jq -r '.automerge_advisory_reason // ""')
+AUTOMERGE_VERDICT=$(echo "$META" | jq -r '.automerge_review_verdict // ""')
+AUTOMERGE_RISK=$(echo "$META" | jq -r '.automerge_risk_class // ""')
+AUTOMERGE_ROUND=$(echo "$META" | jq -r '.automerge_review_round // ""')
+AUTOMERGE_REPORT=$(echo "$META" | jq -r '.automerge_report_path // ""')
+SOURCE_POST_FIX_REVIEW_BEAD=$(echo "$META" | jq -r '.source_post_fix_review_bead // ""')
+
+post_automerge_advisory() {
+    local gate_status="$1"
+    local gate_reason="$2"
+    [ -n "$AUTOMERGE_ADVISORY" ] || return 0
+
+    local final_advisory="$AUTOMERGE_ADVISORY"
+    local title="THUMBS UP"
+    local decision="auto-merge candidate after post-fix review and ship gates"
+    if [ "$gate_status" != "green" ] || [ "$AUTOMERGE_ADVISORY" != "thumbs_up" ]; then
+        final_advisory=thumbs_down
+        title="THUMBS DOWN"
+        decision="not an auto-merge candidate"
+    fi
+
+    local body_file
+    body_file=$(mktemp -t feature-ship-advisory.XXXXXX.md)
+    {
+        printf '## Auto-merge advisory: %s\\n\\n' "$title"
+        printf 'Current behavior: no auto-merge performed.\\n\\n'
+        printf '- **Decision:** %s\\n' "$decision"
+        printf '- **Post-fix advisory:** `%s`\\n' "$AUTOMERGE_ADVISORY"
+        [ -n "$AUTOMERGE_REASON" ] && printf '- **Post-fix reason:** %s\\n' "$AUTOMERGE_REASON"
+        [ -n "$AUTOMERGE_VERDICT" ] && printf '- **Post-fix verdict:** `%s`\\n' "$AUTOMERGE_VERDICT"
+        [ -n "$AUTOMERGE_RISK" ] && printf '- **Risk class:** `%s`\\n' "$AUTOMERGE_RISK"
+        [ -n "$AUTOMERGE_ROUND" ] && printf '- **Review round:** `%s`\\n' "$AUTOMERGE_ROUND"
+        printf '- **Mechanical gates:** %s\\n' "$gate_reason"
+        [ -n "$GATES_PASSED" ] && printf '- **Gates passed:** `%s`\\n' "$GATES_PASSED"
+        [ -n "$GATES_FAILED" ] && printf '- **Gates failed:** `%s`\\n' "$GATES_FAILED"
+        [ -n "$AUTOMERGE_REPORT" ] && printf '- **Review report:** `%s`\\n' "$AUTOMERGE_REPORT"
+        [ -n "$SOURCE_POST_FIX_REVIEW_BEAD" ] && printf '- **Post-fix review bead:** `%s`\\n' "$SOURCE_POST_FIX_REVIEW_BEAD"
+    } > "$body_file"
+
+    if gh pr comment {{pr}} --body-file "$body_file" >/tmp/feature-ship-advisory-comment-out 2>&1; then
+        COMMENT_URL=$(grep -m1 -oE 'https://github.com/[^[:space:]]+#issuecomment-[0-9]+' /tmp/feature-ship-advisory-comment-out || true)
+        bd update "$ROOT_ID" \\
+            --set-metadata automerge_final_advisory="$final_advisory" \\
+            --set-metadata automerge_comment="${COMMENT_URL:-posted}"
+    else
+        bd update "$ROOT_ID" \\
+            --set-metadata automerge_final_advisory="$final_advisory" \\
+            --set-metadata automerge_comment="failed (see /tmp/feature-ship-advisory-comment-out)"
+        echo "[feature-ship] warning: auto-merge advisory comment failed" >&2
+    fi
+    rm -f "$body_file"
+}
 ```
 
 ### Green path — gh pr ready and mark complete
@@ -487,6 +649,7 @@ GP_TRIMMED=$(echo "$GATES_PASSED" | tr -d ' ')
 
 if [ -z "$GF_TRIMMED" ] && [ -n "$GP_TRIMMED" ]; then
     if ! gh pr ready {{pr}}; then
+        post_automerge_advisory "red" "all gates passed, but gh pr ready failed"
         bd update "$ROOT_ID" \\
             --set-metadata gc.routed_to="$WITNESS_TARGET" \\
             --set-metadata ship_status=blocked \\
@@ -507,6 +670,8 @@ whether the PR was concurrently modified."
         exit 1
     fi
 
+    post_automerge_advisory "green" "all applicable ship gates passed"
+
     bd update "$ROOT_ID" \\
         --set-metadata ship_status=complete \\
         --set-metadata ship_pr_status=ready_for_review \\
@@ -525,6 +690,7 @@ if [ -z "$GF_TRIMMED" ] && [ -z "$GP_TRIMMED" ]; then
     # No gates ran at all — none of the candidate signals matched.
     # Treat as a configuration problem and escalate to witness with the
     # detection detail so the human sees exactly which signals were tried.
+    post_automerge_advisory "red" "no mechanical gates ran"
     bd update "$ROOT_ID" \\
         --set-metadata gc.routed_to="$WITNESS_TARGET" \\
         --set-metadata ship_status=blocked \\
@@ -599,6 +765,8 @@ if [ "$(wc -c < "$SUMMARY_FILE")" -gt 32768 ]; then
     echo "" >> "$SUMMARY_TRUNC"
     echo "[summary truncated — full per-gate logs in $RESULT_DIR on the polecat host]" >> "$SUMMARY_TRUNC"
 fi
+
+post_automerge_advisory "red" "one or more mechanical gates failed"
 
 bd update "$ROOT_ID" \\
     --set-metadata gc.routed_to="$WITNESS_TARGET" \\

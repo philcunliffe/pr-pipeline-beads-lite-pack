@@ -61,7 +61,7 @@ title = "Establish working state and verify repo"
 description = """
 **1. Find the root bead and confirm we're in the upstream gascity tree:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot triage."
     bd close "$ROOT_ID" --reason "not a git checkout"
@@ -130,7 +130,7 @@ description = """
 Three lists feed the classification:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 TS=$(grep -A1 'triage_path:' <(bd show "$ROOT_ID") | head -1 | sed 's|.*triage/||;s|\\.md$||')
 LIMIT=$(bd show "$ROOT_ID" --json | jq -r '.notes // "" | capture("limit: (?<v>\\\\d+)").v // "10"')
 CATEGORY=$(bd show "$ROOT_ID" --json | jq -r '.notes // "" | capture("category: (?<v>\\\\S+)").v // "all"')
@@ -244,7 +244,7 @@ description = """
 Produce the markdown report at the path recorded in step 1.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 TRIAGE_PATH=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""' | grep -m1 '^triage_path:' | sed 's/^triage_path: //')
 ```
 
@@ -337,7 +337,7 @@ Display the report path and recommended pick on stdout for the maintenance
 PL to relay back to Slack:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""')
 TRIAGE_PATH=$(echo "$NOTES" | grep -m1 '^triage_path:' | sed 's/^triage_path: //')
 TIER1=$(echo "$NOTES" | grep -m1 '^tier1:' | sed 's/^tier1: //')

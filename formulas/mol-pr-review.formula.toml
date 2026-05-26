@@ -38,7 +38,7 @@ Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
 1. Caller slings with `--var pr=<url-or-number>`
 2. Agent works through 4 sequential steps
 3. Scorecard report written
-4. Root-bead notes record `verdict:` (block | request_changes | approve)
+4. Root-bead notes record `verdict:` (request_changes | approve)
 5. Agent exits — no fixes are applied
 
 Apply fixes by re-iterating the development loop, not by extending this
@@ -66,7 +66,7 @@ description = """
 Resolve the PR identifier, fetch its data, and prepare the workspace.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot review PR."
     bd close "$ROOT_ID" --reason "not a git checkout"
@@ -140,8 +140,7 @@ below. Each finding has a severity: blocker, major, minor, or nit.
 
 **Decision policy** (apply mechanically):
 
-- Unresolved **blocker** in categories 1-4 → verdict `block`
-- Unresolved **blocker** in categories 5-8 → verdict `request_changes`
+- Unresolved **blocker** in any category → verdict `request_changes`
 - **Major** issues in 1-8 without mitigation → verdict `request_changes`
 - Purely **minor** or **nit** → verdict `approve`
 - No new findings → verdict `approve`
@@ -267,7 +266,7 @@ description = """
 Write the report to `$REPORT_PATH` using this structure:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""' | grep -m1 '^report_path:' | sed 's/^report_path: //')
 ```
 
@@ -280,7 +279,7 @@ REPORT_PATH=$(bd show "$ROOT_ID" --json | jq -r '.notes // ""' | grep -m1 '^repo
 
 ## Verdict
 
-**<block | request_changes | approve>** — <one-sentence reason>
+**<request_changes | approve>** — <one-sentence reason>
 
 ## Decision rationale
 
@@ -324,7 +323,7 @@ Compute the verdict mechanically from finding counts:
 
 ```bash
 # After writing the report, set verdict in bead notes
-VERDICT="<block | request_changes | approve>"
+VERDICT="<request_changes | approve>"
 bd update "$ROOT_ID" --notes "verdict: $VERDICT
 status: complete"
 echo "[pr-review] Review complete for PR <N>"

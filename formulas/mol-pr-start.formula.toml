@@ -55,7 +55,7 @@ Establish working state and read the issue.
 
 **1. Find the root bead and confirm we're in a git repo:**
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot plan."
     bd close "$ROOT_ID" --reason "not a git checkout"
@@ -95,7 +95,7 @@ time planning an issue someone else is fixing or whose area is being
 consolidated by a refactor that'll supersede the work.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 ```
 
@@ -236,7 +236,7 @@ Capture:
 Save the analysis as a heredoc into the bead notes for downstream steps:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 bd update "$ROOT_ID" --notes "blast_radius: <one-line summary>"
 ```
 
@@ -299,7 +299,7 @@ description = """
 Produce the structured plan as a markdown file. This is the deliverable.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 if [ -n "${GC_CITY_PATH:-}" ]; then
     PLAN_DIR="${GC_CITY_PATH}/.gc/pr-pipeline/plans"
 else
@@ -446,7 +446,7 @@ currently doesn't," update the plan file with the addition.
 After the audit, mark the plan finalized:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 if [ -n "${GC_CITY_PATH:-}" ]; then
     PLAN_PATH="${GC_CITY_PATH}/.gc/pr-pipeline/plans/issue-{{issue}}.md"
 else

@@ -60,7 +60,7 @@ description = """
 Confirm we're in a git repo, resolve the branch, and prepare workspace.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot ship."
     bd close "$ROOT_ID" --reason "not a git checkout"
@@ -159,7 +159,7 @@ echo "[ship] Stage 1 reverted — simplify broke the build"
 Record stage outcome:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 bd update "$ROOT_ID" --notes "simplify: <complete | reverted | skipped>
 simplify_commits: <sha1>,<sha2>,..."
 ```
@@ -210,7 +210,7 @@ report as **blocked — review not converging** and stop the formula.
 Record per-iteration state:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 ITER_N=<1|2|3>
 bd update "$ROOT_ID" --notes "review_iter_$ITER_N: blockers=<n>, majors=<n>, minors=<n>
 review_fix_commits_$ITER_N: <sha>,<sha>,..."
@@ -236,7 +236,7 @@ Read-only mechanical checks. The exact gate set depends on the repo's
 stack; run what's available.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 GATES_PASSED=""
 GATES_FAILED=""
 ```
@@ -314,7 +314,7 @@ Combine all stages into a single report and STOP. This formula does NOT
 push, does NOT open a PR. The caller decides next steps.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+ROOT_ID=$(bd mol current --json | jq -r 'if type == "array" then .[0].molecule_id else .molecule_id end')
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes')
 REPORT_PATH=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
 BRANCH=$(echo "$NOTES" | grep -m1 '^branch:' | sed 's/^branch: //')

@@ -7,14 +7,17 @@ computes a single mechanical verdict from the union of all signals.
 
 Sub-formula contract: callers (notably `mol-feature-review`) read
 `verdict:` from the root bead's notes. The contract value space is
-`approve | request_changes | block`, identical to `mol-pr-review`'s
-contract so the new formula is drop-in compatible.
+`approve | request_changes`. Infrastructure failures still record
+`status: blocked`/`failure:` and exit non-zero; they are not review
+verdicts.
 
-This formula does NOT post a GitHub comment. The `/code-review-quiet`
-skill is invoked with `--no-comment --output` so its structured
-comment body is written to the report directory, not posted. Any
-maintainer-visible comment is the caller's responsibility (e.g. the
-`mol-adopt-pr` finalize step in the `pr-review` pack).
+This formula posts one maintainer-visible GitHub comment in the final
+step. The `/code-review-quiet` skill is invoked with
+`--no-comment --output` so Claude's structured review body is written to
+the report directory first; the formula then combines Codex, Claude, and
+blast-radius signals into a single PR summary comment. The comment also
+includes an advisory-only auto-merge thumbs up/down. No merge command is
+run by this formula.
 
 ## Beads-Lite Command Note
 
@@ -36,14 +39,16 @@ Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
    `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>/{codex.md,claude.md,risk.md,dual-review.md}`
 4. Root-bead notes record `verdict:`, `risk_class:`, and
    `report_path:` pointing at the combined index
-5. When `auto_fix=true` AND verdict is `request_changes` or `block`,
+5. When `auto_fix=true` AND verdict is `request_changes`,
    the `file-fix-bead` step synthesizes a fix bead and slings it to
    this rig's polecat pool. `fix_bead_id:` is recorded on root notes.
    Default is `auto_fix=false` (no auto-filing) for backward
    compatibility with callers like `mol-feature-review` that file
    their own rollup fix beads.
-6. Agent exits — no code edits are applied here; the fix bead (if any)
-   carries the work to a polecat.
+6. Complete posts the single canonical PR summary comment, including
+   the advisory-only auto-merge thumbs up/down, then exits. No code edits
+   or merge operations are applied here; the fix bead (if any) carries
+   the work to a polecat.
 
 ## Failure Modes
 
@@ -70,7 +75,7 @@ description = "Optional integration branch label, recorded in notes for callers 
 default = ""
 
 [vars.auto_fix]
-description = "When 'true' AND verdict is request_changes/block, the file-fix-bead step synthesizes a fix bead and slings it to this rig's polecat pool. Default 'false' so callers like mol-feature-review (which files its own rollup fix bead) don't get double-filing."
+description = "When 'true' AND verdict is request_changes, the file-fix-bead step synthesizes a fix bead and slings it to this rig's polecat pool. Default 'false' so callers like mol-feature-review (which files its own rollup fix bead) don't get double-filing."
 default = "false"
 
 [vars.binding_prefix]
@@ -84,7 +89,24 @@ description = """
 Resolve the PR identifier, fetch its data, and prepare the workspace.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+resolve_root_id() {
+    root=$(bd mol current --json 2>/dev/null | jq -r 'if type == "array" then (.[0].molecule_id // empty) else (.molecule_id // empty) end' 2>/dev/null || true)
+    if [ -n "$root" ] && [ "$root" != "null" ]; then
+        printf '%s\\n' "$root"
+        return 0
+    fi
+
+    current=$(bd show --current --json 2>/dev/null || true)
+    current_id=$(printf '%s\\n' "$current" | jq -r 'if type == "array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null || true)
+    if printf '%s\\n' "$current_id" | grep -Eq '^[a-z][a-z0-9]*-[a-z0-9]+\\.[0-9]+$'; then
+        printf '%s\\n' "$current_id" | sed 's/\\.[0-9][0-9]*$//'
+        return 0
+    fi
+
+    echo "Could not resolve root molecule id; bd mol current returned empty and current bead is '$current_id'" >&2
+    return 1
+}
+ROOT_ID=$(resolve_root_id) || exit 1
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not in a git repository — cannot review PR."
     bd close "$ROOT_ID" --reason "not a git checkout"
@@ -130,6 +152,20 @@ else
     REPORT_DIR=".gc/pr-pipeline/reviews/pr-${PR_NUM}"
 fi
 mkdir -p "$REPORT_DIR"
+
+STALE_DIR="$REPORT_DIR/archive-$(date -u +%Y%m%dT%H%M%SZ)"
+for path in \
+    "$REPORT_DIR/codex.md" \
+    "$REPORT_DIR/claude.md" \
+    "$REPORT_DIR/codex.stderr" \
+    "$REPORT_DIR/codex.stdout" \
+    "$REPORT_DIR/risk.md" \
+    "$REPORT_DIR/dual-review.md"; do
+    if [ -e "$path" ]; then
+        mkdir -p "$STALE_DIR"
+        mv "$path" "$STALE_DIR"/
+    fi
+done
 ```
 
 Record initial state on the root bead. Also persist the PR's head and
@@ -193,11 +229,59 @@ Specifically:
 Read the values captured in `intake` from root-bead notes:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+resolve_root_id() {
+    root=$(bd mol current --json 2>/dev/null | jq -r 'if type == "array" then (.[0].molecule_id // empty) else (.molecule_id // empty) end' 2>/dev/null || true)
+    if [ -n "$root" ] && [ "$root" != "null" ]; then
+        printf '%s\\n' "$root"
+        return 0
+    fi
+
+    current=$(bd show --current --json 2>/dev/null || true)
+    current_id=$(printf '%s\\n' "$current" | jq -r 'if type == "array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null || true)
+    if printf '%s\\n' "$current_id" | grep -Eq '^[a-z][a-z0-9]*-[a-z0-9]+\\.[0-9]+$'; then
+        printf '%s\\n' "$current_id" | sed 's/\\.[0-9][0-9]*$//'
+        return 0
+    fi
+
+    echo "Could not resolve root molecule id; bd mol current returned empty and current bead is '$current_id'" >&2
+    return 1
+}
+ROOT_ID=$(resolve_root_id) || exit 1
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
-PR_NUM=$(echo "$NOTES" | grep -m1 '^pr:'           | sed 's/^pr: //')
-REPO=$(echo    "$NOTES" | grep -m1 '^repo:'         | sed 's/^repo: //')
-REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+PR_NUM=$(echo "$NOTES" | grep '^pr:'           | tail -1 | sed 's/^pr: //')
+REPO=$(echo    "$NOTES" | grep '^repo:'         | tail -1 | sed 's/^repo: //')
+REPORT_DIR=$(echo "$NOTES" | grep '^report_path:' | tail -1 | sed 's/^report_path: //')
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: not a git checkout before dual-review"
+    exit 1
+}
+cd "$REPO_ROOT"
+
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: review worktree has tracked local changes; refusing to checkout PR head"
+    exit 1
+fi
+
+if ! gh pr checkout "$PR_NUM" --repo "$REPO" --detach; then
+    bd update "$ROOT_ID" --append-notes "status: blocked
+failure: could not checkout PR #$PR_NUM head for review"
+    exit 1
+fi
+
+STALE_DIR="$REPORT_DIR/archive-$(date -u +%Y%m%dT%H%M%SZ)-dual-review"
+for path in \
+    "$REPORT_DIR/codex.md" \
+    "$REPORT_DIR/claude.md" \
+    "$REPORT_DIR/codex.stderr" \
+    "$REPORT_DIR/codex.stdout"; do
+    if [ -e "$path" ]; then
+        mkdir -p "$STALE_DIR"
+        mv "$path" "$STALE_DIR"/
+    fi
+done
 ```
 
 ### Build the Codex prompt and PTY wrapper
@@ -359,10 +443,11 @@ CODEXROLE
 cat "$PROMPT_DIR/codex-role.md" "$CONTEXT_FILE" > "$PROMPT_DIR/codex-reviewer.md"
 ```
 
-Write the Codex PTY wrapper script. Prefers `aimux run codex …` when
-aimux is on PATH and falls back to direct `codex exec` when it isn't —
-output capture and the downstream ANSI/block parser are identical for
-both paths. Verbatim pattern from the `review-pr` skill — exec via
+Write the Codex PTY wrapper script. Use direct `codex exec`; do not
+route through `aimux`. The installed `aimux` CLI shape is not stable
+enough for formula code (for example, current versions expose `spawn`
+and `agents`, not `run` or `status`), and an unsupported subcommand
+produces an empty `codex.md` that stalls this step. Exec via
 `script -q -e -f -c`, NOT `-o`:
 
 ```bash
@@ -384,20 +469,24 @@ fi
 LOG_FILE=$(mktemp /tmp/codex-pty-XXXXXX.log)
 trap 'rm -f "$LOG_FILE"' EXIT
 
-CMD_FILE=$(mktemp /tmp/codex-cmd-XXXXXX.sh)
-# Prefer aimux (better PTY handling + account isolation); fall back to
-# direct `codex exec` when aimux is not on PATH. Both paths feed into
-# the same `script -q -e -f -c` outer below so the downstream
-# ANSI/block parser is identical. `unset CLAUDECODE` keeps Claude-
-# related env from leaking into the codex environment.
-if command -v aimux >/dev/null 2>&1; then
-  printf 'unset CLAUDECODE; command cat %q | aimux run codex -m gpt-5.3-codex exec --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' -- -\\n' "$PROMPT_FILE" > "$CMD_FILE"
-else
-  printf 'unset CLAUDECODE; codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' - < %q\\n' "$PROMPT_FILE" > "$CMD_FILE"
+if ! command -v codex >/dev/null 2>&1; then
+  echo "ERROR: codex CLI not found on PATH" >&2
+  exit 1
 fi
+
+CMD_FILE=$(mktemp /tmp/codex-cmd-XXXXXX.sh)
+# `unset CLAUDECODE` keeps Claude-related env from leaking into the
+# codex environment.
+printf 'unset CLAUDECODE; codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' - < %q\\n' "$PROMPT_FILE" > "$CMD_FILE"
 chmod +x "$CMD_FILE"
 
-timeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+if command -v timeout >/dev/null 2>&1; then
+  timeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+elif command -v gtimeout >/dev/null 2>&1; then
+  gtimeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+else
+  script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+fi
 
 rm -f "$CMD_FILE"
 
@@ -443,11 +532,7 @@ else:
 ' "$LOG_FILE" > "$OUTPUT_FILE"
 
 if [[ ! -s "$OUTPUT_FILE" ]]; then
-  if command -v aimux >/dev/null 2>&1; then
-    echo "ERROR: Codex produced empty output. Check aimux status (e.g. 'aimux status'); see log tail below." >&2
-  else
-    echo "ERROR: Codex produced empty output. aimux not on PATH; using direct codex exec failed. Check that 'codex' is on PATH and the log tail below." >&2
-  fi
+  echo "ERROR: Codex produced empty output from direct codex exec. Check that 'codex' can run non-interactively; see log tail below." >&2
   tail -50 "$LOG_FILE" >&2 || true
   exit 1
 fi
@@ -501,13 +586,13 @@ CLAUDE_OK=0
 [ -s "$REPORT_DIR/claude.md" ] && CLAUDE_OK=1
 
 if [ "$CODEX_OK" = 0 ] && [ "$CLAUDE_OK" = 0 ]; then
-    bd update "$ROOT_ID" --notes "status: blocked
+    bd update "$ROOT_ID" --append-notes "status: blocked
 failure: both reviewers produced empty output"
     echo "[dual-review] both reviewers empty — blocked"
     exit 1
 fi
 
-bd update "$ROOT_ID" --notes "codex_ok: $CODEX_OK
+bd update "$ROOT_ID" --append-notes "codex_ok: $CODEX_OK
 claude_ok: $CLAUDE_OK"
 ```
 
@@ -528,10 +613,27 @@ that intersect with high-blast-radius surfaces.
 Read the values captured in `intake`:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+resolve_root_id() {
+    root=$(bd mol current --json 2>/dev/null | jq -r 'if type == "array" then (.[0].molecule_id // empty) else (.molecule_id // empty) end' 2>/dev/null || true)
+    if [ -n "$root" ] && [ "$root" != "null" ]; then
+        printf '%s\\n' "$root"
+        return 0
+    fi
+
+    current=$(bd show --current --json 2>/dev/null || true)
+    current_id=$(printf '%s\\n' "$current" | jq -r 'if type == "array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null || true)
+    if printf '%s\\n' "$current_id" | grep -Eq '^[a-z][a-z0-9]*-[a-z0-9]+\\.[0-9]+$'; then
+        printf '%s\\n' "$current_id" | sed 's/\\.[0-9][0-9]*$//'
+        return 0
+    fi
+
+    echo "Could not resolve root molecule id; bd mol current returned empty and current bead is '$current_id'" >&2
+    return 1
+}
+ROOT_ID=$(resolve_root_id) || exit 1
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
-PR_NUM=$(echo "$NOTES" | grep -m1 '^pr:'           | sed 's/^pr: //')
-REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+PR_NUM=$(echo "$NOTES" | grep '^pr:'           | tail -1 | sed 's/^pr: //')
+REPORT_DIR=$(echo "$NOTES" | grep '^report_path:' | tail -1 | sed 's/^report_path: //')
 RIG="${GC_RIG:-<rig>}"
 ```
 
@@ -545,30 +647,36 @@ SCOPE="PR #${PR_NUM} changed files: ${CHANGED_FILES}"
 KEY="pr-${PR_NUM}"
 ```
 
-Sling `mol-pr-blast-radius` and capture the sub-bead ID. Note that
-`mol-pr-blast-radius` is in the same pack, so we invoke it via the
-pack-binding sling form:
+Sling `mol-pr-blast-radius` and capture the sub-bead ID. Prefer the
+`pr-pipeline` command binding, but fall back to direct polecat routing
+when the binding is unavailable. Do not assume the bead ID uses this
+pack's `prblp-*` prefix: cross-rig slings create IDs in the target
+rig's prefix (for example `hy-*` in the hypaware rig).
 
 ```bash
-SUB_OUT=$(gc "${RIG}/pr-pipeline" sling mol-pr-blast-radius --formula \\
-    --var "scope=$SCOPE" --var "key=$KEY" 2>&1)
-BLAST_BEAD=$(echo "$SUB_OUT" | grep -oE 'prblp-[a-z0-9]+' | tail -1)
+extract_existing_bead_id() {
+    candidates=$(printf '%s\n' "$1" | grep -oE '[a-z][a-z0-9]*-[a-z0-9]+' || true)
+    [ -n "$candidates" ] || return 0
+    printf '%s\n' "$candidates" \
+        | while IFS= read -r candidate; do
+            bd show "$candidate" --json >/dev/null 2>&1 && printf '%s\n' "$candidate"
+          done \
+        | tail -1
+}
+
+if ! SUB_OUT=$(gc pr-pipeline pr blast-radius "$SCOPE" --rig "$RIG" --key "$KEY" 2>&1); then
+    SUB_OUT=$(gc sling "${RIG}/gastown-beads-lite.polecat" mol-pr-blast-radius \\
+        --formula --var "scope=$SCOPE" --var "key=$KEY" 2>&1)
+fi
+BLAST_BEAD=$(extract_existing_bead_id "$SUB_OUT")
 
 if [ -z "$BLAST_BEAD" ]; then
-    bd update "$ROOT_ID" --notes "status: blocked
+    bd update "$ROOT_ID" --append-notes "status: blocked
 failure: could not capture blast-radius sub-bead"
     exit 1
 fi
 
-bd update "$ROOT_ID" --notes "blast_radius_bead: $BLAST_BEAD"
-```
-
-If the rig doesn't expose `gc <rig>/pr-pipeline sling ...`, fall back
-to a direct sling against the polecat pool:
-
-```bash
-gc sling "${RIG}/gastown-beads-lite.polecat" mol-pr-blast-radius \\
-    --formula --var "scope=$SCOPE" --var "key=$KEY"
+bd update "$ROOT_ID" --append-notes "blast_radius_bead: $BLAST_BEAD"
 ```
 
 Wait for the sub-bead to close (same pattern `mol-feature-review` uses
@@ -578,7 +686,7 @@ to wait on `mol-pr-review`):
 for _ in $(seq 1 120); do
     STATUS=$(bd show "$BLAST_BEAD" --json \\
         | jq -r '.[0].notes // ""' \\
-        | grep -m1 '^status:' | sed 's/^status: //' || true)
+        | grep '^status:' | tail -1 | sed 's/^status: //' || true)
     if [ "$STATUS" = "complete" ]; then
         break
     fi
@@ -586,7 +694,7 @@ for _ in $(seq 1 120); do
 done
 
 if [ "$STATUS" != "complete" ]; then
-    bd update "$ROOT_ID" --notes "status: blocked
+    bd update "$ROOT_ID" --append-notes "status: blocked
 failure: blast-radius sub-bead $BLAST_BEAD did not complete"
     exit 1
 fi
@@ -598,14 +706,14 @@ Read `risk_class` from the sub-bead's notes (emitted by the updated
 ```bash
 RISK_CLASS=$(bd show "$BLAST_BEAD" --json \\
     | jq -r '.[0].notes // ""' \\
-    | grep -m1 '^risk_class:' | sed 's/^risk_class: //')
+    | grep '^risk_class:' | tail -1 | sed 's/^risk_class: //')
 
 case "$RISK_CLASS" in
     low|medium|high) ;;
     *) RISK_CLASS="low" ;;   # Safe default if classification absent
 esac
 
-bd update "$ROOT_ID" --notes "risk_class: $RISK_CLASS"
+bd update "$ROOT_ID" --append-notes "risk_class: $RISK_CLASS"
 ```
 
 Capture the blast-radius report path and Risks section for the
@@ -614,11 +722,11 @@ cross-reference table:
 ```bash
 BLAST_REPORT=$(bd show "$BLAST_BEAD" --json \\
     | jq -r '.[0].notes // ""' \\
-    | grep -m1 '^report_path:' | sed 's/^report_path: //')
+    | grep '^report_path:' | tail -1 | sed 's/^report_path: //')
 
 # Record the blast-radius report path on root notes so the complete
 # step can inline its Risks section into the PR comment.
-bd update "$ROOT_ID" --notes "blast_radius_report: $BLAST_REPORT"
+bd update "$ROOT_ID" --append-notes "blast_radius_report: $BLAST_REPORT"
 ```
 
 Build the risk capstone report. Walk the reviewer reports for any
@@ -679,8 +787,7 @@ by severity, then apply the decision rubric:
 
 | Condition                                                             | Verdict          |
 |-----------------------------------------------------------------------|------------------|
-| Any blocker in categories 1-4 (in either review)                      | block            |
-| Any blocker in categories 5-8 (in either review) OR risk_class=high   | request_changes  |
+| Any blocker, critical issue, or risk_class=high                       | request_changes  |
 | Majors in any category 1-8 OR (risk_class=medium AND any findings)    | request_changes  |
 | Otherwise (only minors, nits, or no findings)                         | approve          |
 
@@ -689,8 +796,9 @@ category taxonomy. The Codex prompt above uses that taxonomy.
 `/code-review-quiet`'s output does not — it has free-form severities
 (blocker / major / minor / nit). Be permissive in parsing:
 
-- Anything explicitly marked "blocker" or that mentions "BUG" /
-  "critical" in the heading → blocker
+- Anything explicitly marked "blocker", "BUG", or "critical" is counted
+  as a blocker signal, but blocker signals request changes rather than
+  producing a separate `block` verdict
 - Anything explicitly marked "major" or "important" → major
 - Anything explicitly marked "minor" → minor
 - Anything explicitly marked "nit" → nit
@@ -723,10 +831,27 @@ parse_codex_severities() {
 Apply the rubric:
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+resolve_root_id() {
+    root=$(bd mol current --json 2>/dev/null | jq -r 'if type == "array" then (.[0].molecule_id // empty) else (.molecule_id // empty) end' 2>/dev/null || true)
+    if [ -n "$root" ] && [ "$root" != "null" ]; then
+        printf '%s\\n' "$root"
+        return 0
+    fi
+
+    current=$(bd show --current --json 2>/dev/null || true)
+    current_id=$(printf '%s\\n' "$current" | jq -r 'if type == "array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null || true)
+    if printf '%s\\n' "$current_id" | grep -Eq '^[a-z][a-z0-9]*-[a-z0-9]+\\.[0-9]+$'; then
+        printf '%s\\n' "$current_id" | sed 's/\\.[0-9][0-9]*$//'
+        return 0
+    fi
+
+    echo "Could not resolve root molecule id; bd mol current returned empty and current bead is '$current_id'" >&2
+    return 1
+}
+ROOT_ID=$(resolve_root_id) || exit 1
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
-RISK_CLASS=$(echo "$NOTES" | grep -m1 '^risk_class:' | sed 's/^risk_class: //')
-REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
+RISK_CLASS=$(echo "$NOTES" | grep '^risk_class:' | tail -1 | sed 's/^risk_class: //')
+REPORT_DIR=$(echo "$NOTES" | grep '^report_path:' | tail -1 | sed 's/^report_path: //')
 
 # Counts from Codex output (taxonomy-aware)
 BLOCKER_LOW=0   # cats 1-4
@@ -770,10 +895,10 @@ if [ "$BLOCKER_LOW" -gt 0 ] || [ "$BLOCKER_HIGH" -gt 0 ] || [ "$MAJOR" -gt 0 ] |
 fi
 
 if [ "$BLOCKER_LOW" -gt 0 ] || [ "$CLAUDE_BLOCKERS" -gt 0 ]; then
-    VERDICT="block"
+    VERDICT="request_changes"
 elif [ "$BLOCKER_HIGH" -gt 0 ] || [ "$RISK_CLASS" = "high" ]; then
     VERDICT="request_changes"
-elif [ "$MAJOR" -gt 0 ] || [ "$CLAUDE_MAJORS" -gt 0 ]; then
+elif [ "$MAJOR" -gt 0 ] || [ "$CLAUDE_MAJORS" -gt 0 ] || [ "$CLAUDE_FINDINGS" -gt 0 ]; then
     VERDICT="request_changes"
 elif [ "$RISK_CLASS" = "medium" ] && [ "$ANY_REVIEWER_FINDINGS" -gt 0 ]; then
     VERDICT="request_changes"
@@ -781,7 +906,7 @@ else
     VERDICT="approve"
 fi
 
-bd update "$ROOT_ID" --notes "verdict: $VERDICT
+bd update "$ROOT_ID" --append-notes "verdict: $VERDICT
 codex_blocker_low: $BLOCKER_LOW
 codex_blocker_high: $BLOCKER_HIGH
 codex_major: $MAJOR
@@ -801,8 +926,8 @@ step; pass it the codex report path. If Codex output omits the
 silently skipped — accept the false-negative; the Claude path provides
 backstop coverage.
 
-**Exit criteria:** `verdict` is one of `{approve, request_changes,
-block}` and recorded on root bead notes alongside finding counts.
+**Exit criteria:** `verdict` is one of `{approve, request_changes}` and
+recorded on root bead notes alongside finding counts.
 """
 
 [[steps]]
@@ -811,7 +936,7 @@ title = "(Optional) Synthesize a fix bead and sling it when changes are requeste
 needs = ["verdict"]
 description = """
 Conditional step: if `auto_fix=true` (caller opted in) AND the verdict
-is `request_changes` or `block`, synthesize a fix bead from the
+is `request_changes`, synthesize a fix bead from the
 dual-review report and route it to this rig's polecat pool. The fix
 polecat reads the structured report files directly — the bead body
 just points to them and lists acceptance criteria.
@@ -827,27 +952,44 @@ if [ "$AUTO_FIX" != "true" ]; then
     exit 0
 fi
 
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+resolve_root_id() {
+    root=$(bd mol current --json 2>/dev/null | jq -r 'if type == "array" then (.[0].molecule_id // empty) else (.molecule_id // empty) end' 2>/dev/null || true)
+    if [ -n "$root" ] && [ "$root" != "null" ]; then
+        printf '%s\\n' "$root"
+        return 0
+    fi
+
+    current=$(bd show --current --json 2>/dev/null || true)
+    current_id=$(printf '%s\\n' "$current" | jq -r 'if type == "array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null || true)
+    if printf '%s\\n' "$current_id" | grep -Eq '^[a-z][a-z0-9]*-[a-z0-9]+\\.[0-9]+$'; then
+        printf '%s\\n' "$current_id" | sed 's/\\.[0-9][0-9]*$//'
+        return 0
+    fi
+
+    echo "Could not resolve root molecule id; bd mol current returned empty and current bead is '$current_id'" >&2
+    return 1
+}
+ROOT_ID=$(resolve_root_id) || exit 1
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
-VERDICT=$(echo "$NOTES" | grep -m1 '^verdict:' | sed 's/^verdict: //')
+VERDICT=$(echo "$NOTES" | grep '^verdict:' | tail -1 | sed 's/^verdict: //')
 case "$VERDICT" in
-    request_changes|block) ;;
+    request_changes) ;;
     *)
         echo "[dual-review] verdict=$VERDICT — no fix bead needed"
         exit 0
         ;;
 esac
 
-PR_NUM=$(echo "$NOTES"     | grep -m1 '^pr:'          | sed 's/^pr: //')
-REPO=$(echo "$NOTES"       | grep -m1 '^repo:'        | sed 's/^repo: //')
-REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
-RISK_CLASS=$(echo "$NOTES" | grep -m1 '^risk_class:'  | sed 's/^risk_class: //')
-HEAD_REF=$(echo "$NOTES"   | grep -m1 '^head_ref:'    | sed 's/^head_ref: //')
-BASE_REF=$(echo "$NOTES"   | grep -m1 '^base_ref:'    | sed 's/^base_ref: //')
+PR_NUM=$(echo "$NOTES"     | grep '^pr:'          | tail -1 | sed 's/^pr: //')
+REPO=$(echo "$NOTES"       | grep '^repo:'        | tail -1 | sed 's/^repo: //')
+REPORT_DIR=$(echo "$NOTES" | grep '^report_path:' | tail -1 | sed 's/^report_path: //')
+RISK_CLASS=$(echo "$NOTES" | grep '^risk_class:'  | tail -1 | sed 's/^risk_class: //')
+HEAD_REF=$(echo "$NOTES"   | grep '^head_ref:'    | tail -1 | sed 's/^head_ref: //')
+BASE_REF=$(echo "$NOTES"   | grep '^base_ref:'    | tail -1 | sed 's/^base_ref: //')
 
 if [ -z "$HEAD_REF" ] || [ -z "$BASE_REF" ]; then
     echo "[dual-review] WARN: missing head_ref or base_ref in root notes; skipping fix-bead" >&2
-    bd update "$ROOT_ID" --notes "fix_bead_id: (skipped: missing branch refs)"
+    bd update "$ROOT_ID" --append-notes "fix_bead_id: (skipped: missing branch refs)"
     exit 0
 fi
 
@@ -904,7 +1046,7 @@ rm -f "$FIX_BODY_FILE"
 
 if [ -z "$FIX_ID" ] || [ "$FIX_ID" = "null" ]; then
     echo "[dual-review] WARN: bd create returned no id for fix bead" >&2
-    bd update "$ROOT_ID" --notes "fix_bead_id: (creation failed)"
+    bd update "$ROOT_ID" --append-notes "fix_bead_id: (creation failed)"
     exit 0
 fi
 
@@ -920,13 +1062,13 @@ if [ -z "$GC_RIG" ]; then
 fi
 
 if gc sling "$SLING_TARGET" "$FIX_ID" >/tmp/dual-review-sling.log 2>&1; then
-    bd update "$ROOT_ID" --notes "fix_bead_id: $FIX_ID
+    bd update "$ROOT_ID" --append-notes "fix_bead_id: $FIX_ID
 fix_bead_routed_to: $SLING_TARGET"
     echo "[dual-review] auto-filed fix bead $FIX_ID → $SLING_TARGET"
 else
     echo "[dual-review] WARN: bd created $FIX_ID but gc sling to $SLING_TARGET failed (see /tmp/dual-review-sling.log)" >&2
     # Still record the bead id — operator can re-sling manually.
-    bd update "$ROOT_ID" --notes "fix_bead_id: $FIX_ID
+    bd update "$ROOT_ID" --append-notes "fix_bead_id: $FIX_ID
 fix_bead_routed_to: (sling failed)"
 fi
 ```
@@ -953,21 +1095,81 @@ visible to reviewers, record verdict + risk class + report path on the
 root bead's notes, and close the bead so the polecat drains.
 
 ```bash
-ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+resolve_root_id() {
+    root=$(bd mol current --json 2>/dev/null | jq -r 'if type == "array" then (.[0].molecule_id // empty) else (.molecule_id // empty) end' 2>/dev/null || true)
+    if [ -n "$root" ] && [ "$root" != "null" ]; then
+        printf '%s\\n' "$root"
+        return 0
+    fi
+
+    current=$(bd show --current --json 2>/dev/null || true)
+    current_id=$(printf '%s\\n' "$current" | jq -r 'if type == "array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null || true)
+    if printf '%s\\n' "$current_id" | grep -Eq '^[a-z][a-z0-9]*-[a-z0-9]+\\.[0-9]+$'; then
+        printf '%s\\n' "$current_id" | sed 's/\\.[0-9][0-9]*$//'
+        return 0
+    fi
+
+    echo "Could not resolve root molecule id; bd mol current returned empty and current bead is '$current_id'" >&2
+    return 1
+}
+ROOT_ID=$(resolve_root_id) || exit 1
 NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
-PR_NUM=$(echo "$NOTES"     | grep -m1 '^pr:'          | sed 's/^pr: //')
-REPO=$(echo "$NOTES"       | grep -m1 '^repo:'        | sed 's/^repo: //')
-REPORT_DIR=$(echo "$NOTES" | grep -m1 '^report_path:' | sed 's/^report_path: //')
-VERDICT=$(echo "$NOTES"    | grep -m1 '^verdict:'     | sed 's/^verdict: //')
-RISK_CLASS=$(echo "$NOTES" | grep -m1 '^risk_class:'  | sed 's/^risk_class: //')
-BLAST_BEAD=$(echo "$NOTES" | grep -m1 '^blast_radius_bead:' | sed 's/^blast_radius_bead: //')
-BLAST_REPORT=$(echo "$NOTES" | grep -m1 '^blast_radius_report:' | sed 's/^blast_radius_report: //')
+PR_NUM=$(echo "$NOTES"     | grep '^pr:'          | tail -1 | sed 's/^pr: //')
+REPO=$(echo "$NOTES"       | grep '^repo:'        | tail -1 | sed 's/^repo: //')
+REPORT_DIR=$(echo "$NOTES" | grep '^report_path:' | tail -1 | sed 's/^report_path: //')
+VERDICT=$(echo "$NOTES"    | grep '^verdict:'     | tail -1 | sed 's/^verdict: //')
+RISK_CLASS=$(echo "$NOTES" | grep '^risk_class:'  | tail -1 | sed 's/^risk_class: //')
+BLAST_BEAD=$(echo "$NOTES" | grep '^blast_radius_bead:' | tail -1 | sed 's/^blast_radius_bead: //')
+BLAST_REPORT=$(echo "$NOTES" | grep '^blast_radius_report:' | tail -1 | sed 's/^blast_radius_report: //')
+CODEX_OK=$(echo "$NOTES" | grep '^codex_ok:' | tail -1 | sed 's/^codex_ok: //')
+CLAUDE_OK=$(echo "$NOTES" | grep '^claude_ok:' | tail -1 | sed 's/^claude_ok: //')
+CODEX_BLOCKER_LOW=$(echo "$NOTES" | grep '^codex_blocker_low:' | tail -1 | sed 's/^codex_blocker_low: //')
+CODEX_BLOCKER_HIGH=$(echo "$NOTES" | grep '^codex_blocker_high:' | tail -1 | sed 's/^codex_blocker_high: //')
+CODEX_MAJOR=$(echo "$NOTES" | grep '^codex_major:' | tail -1 | sed 's/^codex_major: //')
+CLAUDE_BLOCKERS=$(echo "$NOTES" | grep '^claude_blockers:' | tail -1 | sed 's/^claude_blockers: //')
+CLAUDE_MAJORS=$(echo "$NOTES" | grep '^claude_majors:' | tail -1 | sed 's/^claude_majors: //')
+CLAUDE_FINDINGS=$(echo "$NOTES" | grep '^claude_findings:' | tail -1 | sed 's/^claude_findings: //')
+
+[ -n "$CODEX_OK" ] || CODEX_OK=0
+[ -n "$CLAUDE_OK" ] || CLAUDE_OK=0
+[ -n "$CODEX_BLOCKER_LOW" ] || CODEX_BLOCKER_LOW=0
+[ -n "$CODEX_BLOCKER_HIGH" ] || CODEX_BLOCKER_HIGH=0
+[ -n "$CODEX_MAJOR" ] || CODEX_MAJOR=0
+[ -n "$CLAUDE_BLOCKERS" ] || CLAUDE_BLOCKERS=0
+[ -n "$CLAUDE_MAJORS" ] || CLAUDE_MAJORS=0
+[ -n "$CLAUDE_FINDINGS" ] || CLAUDE_FINDINGS=0
+
+if [ -f "$REPORT_DIR" ]; then
+  REPORT_DIR=$(dirname "$REPORT_DIR")
+fi
+
+AUTO_MERGE_ICON="👎"
+AUTO_MERGE_LABEL="thumbs down"
+AUTO_MERGE_REASON="requires human merge gate"
+if [ "$VERDICT" = "approve" ] && \
+   [ "$RISK_CLASS" = "low" ] && \
+   [ "$CODEX_OK" = "1" ] && [ "$CLAUDE_OK" = "1" ] && \
+   [ "$CODEX_BLOCKER_LOW" = "0" ] && [ "$CODEX_BLOCKER_HIGH" = "0" ] && [ "$CODEX_MAJOR" = "0" ] && \
+   [ "$CLAUDE_BLOCKERS" = "0" ] && [ "$CLAUDE_MAJORS" = "0" ] && [ "$CLAUDE_FINDINGS" = "0" ]; then
+  AUTO_MERGE_ICON="👍"
+  AUTO_MERGE_LABEL="thumbs up"
+  AUTO_MERGE_REASON="approve verdict, low blast radius, both reviewer artifacts present, and no blocker/major findings"
+elif [ "$VERDICT" != "approve" ]; then
+  AUTO_MERGE_REASON="verdict is ${VERDICT}; changes still need human-gated follow-up"
+elif [ "$RISK_CLASS" != "low" ]; then
+  AUTO_MERGE_REASON="risk_class is ${RISK_CLASS}; blast radius is too broad for advisory auto-merge"
+elif [ "$CODEX_OK" != "1" ] || [ "$CLAUDE_OK" != "1" ]; then
+  AUTO_MERGE_REASON="one or more reviewer artifacts were missing or empty"
+else
+  AUTO_MERGE_REASON="review counts were not all clean"
+fi
 
 cat > "$REPORT_DIR/dual-review.md" <<INDEXMD
 # Dual-review for PR #${PR_NUM}
 
 - **Verdict:** ${VERDICT}
 - **Risk class:** ${RISK_CLASS}
+- **Auto-merge advisory:** ${AUTO_MERGE_ICON} ${AUTO_MERGE_LABEL} - ${AUTO_MERGE_REASON}
 
 ## Reports
 
@@ -990,11 +1192,18 @@ COMMENT_BODY=$(mktemp -t pr-dual-review-comment.XXXXXX.md)
   printf '## Dual-agent review — `%s`\\n\\n' "$VERDICT"
   printf '- **Verdict:** `%s`\\n' "$VERDICT"
   printf '- **Risk class:** `%s`\\n' "$RISK_CLASS"
+  printf '- **Auto-merge advisory:** %s `%s` - %s\\n' "$AUTO_MERGE_ICON" "$AUTO_MERGE_LABEL" "$AUTO_MERGE_REASON"
   if [ -n "$BLAST_BEAD" ]; then
     printf '- **Blast-radius bead:** `%s`\\n' "$BLAST_BEAD"
   fi
   printf '\\n'
 } > "$COMMENT_BODY"
+
+{
+  printf '### Auto-merge advisory\\n\\n'
+  printf '%s **%s** - %s\\n\\n' "$AUTO_MERGE_ICON" "$AUTO_MERGE_LABEL" "$AUTO_MERGE_REASON"
+  printf '_Advisory only: no merge was attempted._\\n\\n'
+} >> "$COMMENT_BODY"
 
 # Risk capstone excerpt (Risks section + cross-reference)
 if [ -f "$REPORT_DIR/risk.md" ] && [ -s "$REPORT_DIR/risk.md" ]; then
@@ -1047,9 +1256,9 @@ GH_REPO_FLAG=""
 [ -n "$REPO" ] && GH_REPO_FLAG="--repo $REPO"
 if gh pr comment "$PR_NUM" $GH_REPO_FLAG --body-file "$COMMENT_BODY" >/tmp/dual-review-comment-out 2>&1; then
   COMMENT_URL=$(grep -m1 -oE 'https://github.com/[^[:space:]]+#issuecomment-[0-9]+' /tmp/dual-review-comment-out || true)
-  bd update "$ROOT_ID" --notes "pr_comment: ${COMMENT_URL:-posted}"
+  bd update "$ROOT_ID" --append-notes "pr_comment: ${COMMENT_URL:-posted}"
 else
-  bd update "$ROOT_ID" --notes "pr_comment: failed (see /tmp/dual-review-comment-out)"
+  bd update "$ROOT_ID" --append-notes "pr_comment: failed (see /tmp/dual-review-comment-out)"
   echo "[dual-review] warning: gh pr comment failed; verdict still recorded" >&2
 fi
 rm -f "$COMMENT_BODY"
@@ -1058,9 +1267,38 @@ rm -f "$COMMENT_BODY"
 Record final state and close:
 
 ```bash
-bd update "$ROOT_ID" --notes "verdict: ${VERDICT}
-risk_class: ${RISK_CLASS}
+NOTES=$(bd show "$ROOT_ID" --json | jq -r '.[0].notes // ""')
+PR_COMMENT=$(echo "$NOTES" | grep '^pr_comment:' | tail -1 | sed 's/^pr_comment: //')
+INTEGRATION_BRANCH=$(echo "$NOTES" | grep '^integration_branch:' | tail -1 | sed 's/^integration_branch: //')
+HEAD_REF=$(echo "$NOTES" | grep '^head_ref:' | tail -1 | sed 's/^head_ref: //')
+BASE_REF=$(echo "$NOTES" | grep '^base_ref:' | tail -1 | sed 's/^base_ref: //')
+FIX_BEAD_ID=$(echo "$NOTES" | grep '^fix_bead_id:' | tail -1 | sed 's/^fix_bead_id: //')
+FIX_BEAD_ROUTED_TO=$(echo "$NOTES" | grep '^fix_bead_routed_to:' | tail -1 | sed 's/^fix_bead_routed_to: //')
+
+bd update "$ROOT_ID" --notes "pr: ${PR_NUM}
+repo: ${REPO}
+report_dir: ${REPORT_DIR}
 report_path: ${REPORT_DIR}/dual-review.md
+integration_branch: ${INTEGRATION_BRANCH}
+head_ref: ${HEAD_REF}
+base_ref: ${BASE_REF}
+codex_ok: ${CODEX_OK}
+claude_ok: ${CLAUDE_OK}
+blast_radius_bead: ${BLAST_BEAD}
+blast_radius_report: ${BLAST_REPORT}
+verdict: ${VERDICT}
+risk_class: ${RISK_CLASS}
+codex_blocker_low: ${CODEX_BLOCKER_LOW}
+codex_blocker_high: ${CODEX_BLOCKER_HIGH}
+codex_major: ${CODEX_MAJOR}
+claude_blockers: ${CLAUDE_BLOCKERS}
+claude_majors: ${CLAUDE_MAJORS}
+claude_findings: ${CLAUDE_FINDINGS}
+fix_bead_id: ${FIX_BEAD_ID}
+fix_bead_routed_to: ${FIX_BEAD_ROUTED_TO}
+pr_comment: ${PR_COMMENT}
+auto_merge_advisory: ${AUTO_MERGE_LABEL}
+auto_merge_reason: ${AUTO_MERGE_REASON}
 status: complete"
 
 bd close "$ROOT_ID" --reason "dual-review complete; verdict=${VERDICT} risk_class=${RISK_CLASS}"

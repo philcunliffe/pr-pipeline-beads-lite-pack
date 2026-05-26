@@ -41,11 +41,10 @@ Output:
     risk.md          Risk capstone: cross-reference of findings vs
                      blast-radius surfaces, with risk_class
     dual-review.md   Combined index linking the three reports
-  Root-bead notes record `verdict:` (block | request_changes | approve)
+  Root-bead notes record `verdict:` (request_changes | approve)
   and `risk_class:` (low | medium | high).
 
 Decision policy (mechanical, union semantics):
-  Any blocker in cat 1-4 (either reviewer)         → verdict block
-  Any blocker in cat 5-8 OR risk_class=high        → verdict request_changes
+  Any blocker/critical finding OR risk_class=high  → verdict request_changes
   Majors in cat 1-8 OR (risk_class=medium AND any) → verdict request_changes
   Otherwise (only minors / nits / no findings)     → verdict approve
