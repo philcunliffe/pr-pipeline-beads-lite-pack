@@ -3,7 +3,7 @@ Feature-review wrapper around `mol-pr-dual-review` for the
 integration-branch flow. Runs the dual-agent review (Codex + Claude +
 risk capstone) against the draft PR that fronts an integration branch,
 reads the verdict the sub-formula records, and either marks the review
-approved or files a rollup fix bead against the integration branch.
+approved or runs Codex directly to fix findings on the integration branch.
 
 A coding agent (polecat or equivalent) runs this when a review bead is
 dispatched, either manually or by the gastown-beads-lite refinery's
@@ -43,9 +43,9 @@ the convention — it consumes it.
    `status: complete`. The formula files the subsequent ship bead
    inline (with full feature-flow metadata), then closes the review
    bead so the polecat drains cleanly.
-6. On `request_changes`: a rollup fix bead is filed against
-   the integration branch with the full metadata convention. After the
-   fix merges, refinery routing files `mol-feature-post-fix-review`
+6. On `request_changes`: Codex (`gpt-5.5`, max reasoning) is run
+   directly in this polecat session to fix findings. After the fix
+   merges, refinery routing files `mol-feature-post-fix-review`
    before ship can run.
 
 ## Failure Modes
@@ -403,103 +403,104 @@ Failed to create ship bead via bd create. Manual recovery: file a feature-ship b
 fi
 ```
 
-### Request-changes path
+### Request-changes path — run Codex to fix directly
 
-File a rollup fix bead. Per spec v1, dump the full review report into
-the fix bead body under "Findings to address" — the fix polecat re-reads
-the structured report directly. Don't try to parse findings out of the
-report; cleanliness can come later.
+Instead of filing a separate fix bead for a Claude polecat, run
+`codex exec` directly in this polecat session. Codex reads the review
+reports, applies fixes, verifies checks pass, and commits. The
+refinery merges the polecat's worktree into the integration branch,
+then post-merge routing files the post-fix review.
 
 ```bash
 if [ "$VERDICT" = "request_changes" ]; then
-    FIX_TITLE="Fix review findings: {{integration_branch}}"
+    REPORT_DIR=$(dirname "$REPORT_PATH")
 
-    if [ -f "$REPORT_PATH" ]; then
-        REPORT_BODY=$(cat "$REPORT_PATH")
+    # Build the codex fix prompt from the review reports
+    PROMPT_FILE=$(mktemp -t codex-fix-prompt.XXXXXX.md)
+    {
+        echo "# Fix review findings for PR #{{pr}}"
+        echo ""
+        echo "You are fixing code review findings in this repository."
+        echo "Fix ALL of the following issues found by the dual code review."
+        echo ""
+        echo "## Claude findings"
+        echo ""
+        if [ -f "$REPORT_DIR/claude.md" ] && [ -s "$REPORT_DIR/claude.md" ]; then
+            cat "$REPORT_DIR/claude.md"
+        else
+            echo "(No Claude findings)"
+        fi
+        echo ""
+        echo "## Codex findings"
+        echo ""
+        if [ -f "$REPORT_DIR/codex.md" ] && [ -s "$REPORT_DIR/codex.md" ]; then
+            cat "$REPORT_DIR/codex.md"
+        else
+            echo "(No Codex findings)"
+        fi
+        echo ""
+        if [ -f "$REPORT_DIR/risk.md" ] && [ -s "$REPORT_DIR/risk.md" ]; then
+            echo "## Risk capstone"
+            echo ""
+            echo "Prioritize findings flagged as high-blast-radius:"
+            echo ""
+            cat "$REPORT_DIR/risk.md"
+            echo ""
+        fi
+        echo "## Instructions"
+        echo ""
+        echo "- Fix every blocker and major finding with focused code edits"
+        echo "- Add or update tests for each fix"
+        echo "- After all fixes, run the project checks and make sure they pass:"
+        echo "  - If package.json exists: run \\`npm test\\` (or \\`bun test\\` if bun.lock present)"
+        echo "  - If go.mod exists: run \\`go test ./...\\`"
+        echo "  - If Makefile with test target: run \\`make test\\`"
+        echo "  - Run any lint/typecheck scripts available"
+        echo "- If a check fails, fix the failure before committing"
+        echo "- Commit all fixes with a clear message"
+        echo "- Do NOT refactor beyond what the findings require"
+    } > "$PROMPT_FILE"
+
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    CODEX_LOG=$(mktemp -t codex-fix-log.XXXXXX)
+    CODEX_EXIT=0
+
+    cd "$REPO_ROOT"
+    (unset CLAUDECODE; codex exec \\
+        -m gpt-5.5 \\
+        --dangerously-bypass-approvals-and-sandbox \\
+        -c model_reasoning_effort=max \\
+        - < "$PROMPT_FILE" > "$CODEX_LOG" 2>&1) || CODEX_EXIT=$?
+
+    rm -f "$PROMPT_FILE"
+
+    if [ "$CODEX_EXIT" -ne 0 ]; then
+        echo "[feature-review] WARN: codex exec failed (exit=$CODEX_EXIT)" >&2
+        bd update "$ROOT_ID" --notes "verdict: $VERDICT
+review_report: $REPORT_PATH
+codex_fix: failed (exit=$CODEX_EXIT)
+status: blocked
+failure: codex exec failed"
+        # fall through to failure path
     else
-        REPORT_BODY="(report file not found at $REPORT_PATH — see sub-formula bead notes)"
-    fi
-
-    FIX_BODY=$(cat <<EOM
-# Fix review findings for {{integration_branch}}
-
-The outgoing-PR review (PR #{{pr}}) returned verdict: $VERDICT.
-
-## Review report
-
-Full report path: $REPORT_PATH
-
-## Findings to address
-
-The structured scorecard below is reproduced verbatim from the report.
-Address every blocker and major finding. Minors may be addressed at
-your discretion; document any minor you intentionally defer in the
-commit messages.
-
-$REPORT_BODY
-
-## Workflow
-
-- Branch off origin/{{integration_branch}} (the polecat formula handles
-  this via metadata.target / metadata.merge_strategy).
-- Address all findings recorded above.
-- Push to your polecat branch.
-- Refinery rebases + merges into {{integration_branch}}.
-- Refinery's post-merge routing detects this fix's last-merge and files
-  a post-fix review/advisory bead. Ship is filed only after that
-  post-fix review records an acceptable result.
-EOM
-)
-
-    # Create the fix bead. Use a temp file for the body so newlines and
-    # embedded markdown survive shell quoting.
-    FIX_BODY_FILE=$(mktemp -t fix-body.XXXXXX.md)
-    printf '%s\\n' "$FIX_BODY" > "$FIX_BODY_FILE"
-    FIX_ID=$(bd create "$FIX_TITLE" --description-file "$FIX_BODY_FILE" --json | jq -r '.id // .[0].id')
-    rm -f "$FIX_BODY_FILE"
-
-    if [ -z "$FIX_ID" ] || [ "$FIX_ID" = "null" ]; then
-        bd update "$ROOT_ID" --notes "status: blocked
-failure: bd create returned no id for fix bead"
-        # fall through to failure path below
-    else
-        bd update "$FIX_ID" \\
-            --set-metadata target={{integration_branch}} \\
-            --set-metadata feature_phase=fix \\
-            --set-metadata formula=mol-feature-polecat-work \\
-            --set-metadata merge_strategy=integration \\
-            --set-metadata gc.routed_to=$RIG/gastown-beads-lite.polecat \\
-            --set-metadata pr={{pr}} \\
-            --set-metadata review_round=1 \\
-            --set-metadata source_review_bead=$ROOT_ID
-
-        # Graph hygiene: the fix is blocked-by the review.
-        bd dep add "$FIX_ID" --blocked-by "$ROOT_ID" || true
+        # Verify codex made changes — check for uncommitted or recent commit
+        if [ -n "$(git diff HEAD --name-only 2>/dev/null)" ] || [ -n "$(git diff --staged --name-only 2>/dev/null)" ]; then
+            git add -A
+            git commit -m "fix: address review findings via codex (PR #{{pr}})"
+        fi
+        CODEX_SHA=$(git rev-parse HEAD)
 
         bd update "$ROOT_ID" --notes "verdict: $VERDICT
 review_report: $REPORT_PATH
-fix_bead_id: $FIX_ID
+codex_fix: applied at $CODEX_SHA
+codex_fix_log: $CODEX_LOG
 status: complete"
 
-        bd close "$ROOT_ID" --reason "feature-review $VERDICT; filed fix bead $FIX_ID"
-        gc sling "$RIG/gastown-beads-lite.polecat" "$FIX_ID" --nudge || {
-            gc mail send "$RIG/gastown-beads-lite.witness" \\
-                -s "ESCALATION: feature-review could not sling fix bead $FIX_ID for {{integration_branch}}" \\
-                -m "Review bead: $ROOT_ID
-Verdict: $VERDICT
-Fix bead: $FIX_ID
-Integration: {{integration_branch}}
-PR: #{{pr}}
-
-The review bead was closed and the fix bead has gc.routed_to metadata, but gc sling failed. Manual recovery: route $FIX_ID to $RIG/gastown-beads-lite.polecat."
-            exit 1
-        }
-
-        echo "[feature-review] $VERDICT — filed fix bead $FIX_ID"
+        bd close "$ROOT_ID" --reason "feature-review $VERDICT; codex fix applied at $CODEX_SHA"
+        echo "[feature-review] $VERDICT — codex fix applied at $CODEX_SHA"
         echo "[feature-review]   Integration branch: {{integration_branch}}"
         echo "[feature-review]   PR #{{pr}}"
         echo "[feature-review]   Report: $REPORT_PATH"
-        echo "[feature-review]   Routed to: $RIG/gastown-beads-lite.polecat"
         exit 0
     fi
 fi
