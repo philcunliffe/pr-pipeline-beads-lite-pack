@@ -477,15 +477,21 @@ fi
 CMD_FILE=$(mktemp /tmp/codex-cmd-XXXXXX.sh)
 # `unset CLAUDECODE` keeps Claude-related env from leaking into the
 # codex environment.
-printf 'unset CLAUDECODE; codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort='"'"'"xhigh"'"'"' - < %q\\n' "$PROMPT_FILE" > "$CMD_FILE"
+printf 'unset CLAUDECODE; codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort=xhigh - < %q\\n' "$PROMPT_FILE" > "$CMD_FILE"
 chmod +x "$CMD_FILE"
 
-if command -v timeout >/dev/null 2>&1; then
-  timeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
-elif command -v gtimeout >/dev/null 2>&1; then
-  gtimeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+if [[ "$OSTYPE" == darwin* ]]; then
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$TIMEOUT" script -q "$LOG_FILE" bash "$CMD_FILE" > /dev/null 2>&1 || true
+  else
+    script -q "$LOG_FILE" bash "$CMD_FILE" > /dev/null 2>&1 || true
+  fi
 else
-  script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$TIMEOUT" script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+  else
+    script -q -e -f -c "bash '$CMD_FILE'" "$LOG_FILE" > /dev/null 2>&1 || true
+  fi
 fi
 
 rm -f "$CMD_FILE"
