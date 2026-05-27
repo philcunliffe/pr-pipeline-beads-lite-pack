@@ -1072,9 +1072,9 @@ CODEX_EXIT=0
 
 cd "$REPO_ROOT"
 (unset CLAUDECODE; codex exec \\
-    -m gpt-5.3-codex \\
+    -m gpt-5.5 \\
     --dangerously-bypass-approvals-and-sandbox \\
-    -c model_reasoning_effort=high \\
+    -c model_reasoning_effort=max \\
     - < "$PROMPT_FILE" > "$CODEX_LOG" 2>&1) || CODEX_EXIT=$?
 
 rm -f "$PROMPT_FILE"
