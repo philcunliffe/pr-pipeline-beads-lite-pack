@@ -415,51 +415,52 @@ then post-merge routing files the post-fix review.
 if [ "$VERDICT" = "request_changes" ]; then
     REPORT_DIR=$(dirname "$REPORT_PATH")
 
-    # Build the codex fix prompt from the review reports
-    PROMPT_FILE=$(mktemp -t codex-fix-prompt.XXXXXX.md)
+    # Collate findings via Haiku into a focused fix prompt
+    RAW_REPORTS=$(mktemp -t codex-raw-reports.XXXXXX.md)
     {
-        echo "# Fix review findings for PR #{{pr}}"
+        echo "## Claude review"
+        [ -f "$REPORT_DIR/claude.md" ] && [ -s "$REPORT_DIR/claude.md" ] && cat "$REPORT_DIR/claude.md" || echo "(none)"
         echo ""
-        echo "You are fixing code review findings in this repository."
-        echo "Fix ALL of the following issues found by the dual code review."
+        echo "## Codex review"
+        [ -f "$REPORT_DIR/codex.md" ] && [ -s "$REPORT_DIR/codex.md" ] && cat "$REPORT_DIR/codex.md" || echo "(none)"
         echo ""
-        echo "## Claude findings"
-        echo ""
-        if [ -f "$REPORT_DIR/claude.md" ] && [ -s "$REPORT_DIR/claude.md" ]; then
-            cat "$REPORT_DIR/claude.md"
-        else
-            echo "(No Claude findings)"
-        fi
-        echo ""
-        echo "## Codex findings"
-        echo ""
-        if [ -f "$REPORT_DIR/codex.md" ] && [ -s "$REPORT_DIR/codex.md" ]; then
-            cat "$REPORT_DIR/codex.md"
-        else
-            echo "(No Codex findings)"
-        fi
-        echo ""
-        if [ -f "$REPORT_DIR/risk.md" ] && [ -s "$REPORT_DIR/risk.md" ]; then
-            echo "## Risk capstone"
-            echo ""
-            echo "Prioritize findings flagged as high-blast-radius:"
-            echo ""
-            cat "$REPORT_DIR/risk.md"
-            echo ""
-        fi
-        echo "## Instructions"
-        echo ""
-        echo "- Fix every blocker and major finding with focused code edits"
-        echo "- Add or update tests for each fix"
-        echo "- After all fixes, run the project checks and make sure they pass:"
-        echo "  - If package.json exists: run \\`npm test\\` (or \\`bun test\\` if bun.lock present)"
-        echo "  - If go.mod exists: run \\`go test ./...\\`"
-        echo "  - If Makefile with test target: run \\`make test\\`"
-        echo "  - Run any lint/typecheck scripts available"
-        echo "- If a check fails, fix the failure before committing"
-        echo "- Commit all fixes with a clear message"
-        echo "- Do NOT refactor beyond what the findings require"
-    } > "$PROMPT_FILE"
+        [ -f "$REPORT_DIR/risk.md" ] && [ -s "$REPORT_DIR/risk.md" ] && { echo "## Risk capstone"; cat "$REPORT_DIR/risk.md"; }
+    } > "$RAW_REPORTS"
+
+    PROMPT_FILE=$(mktemp -t codex-fix-prompt.XXXXXX.md)
+    claude -m haiku --print -p "Extract actionable findings from these code review reports into a structured fix prompt for a coding agent. For each finding output:
+
+- Issue number (sequential)
+- Source (Claude or Codex)
+- Severity (blocker/major/minor)
+- One-line description of the bug or violation
+- File path and line range
+- Suggested fix (one sentence)
+
+Skip all boilerplate: 'No Finding' sections, evidence bundles, fix validations, emoji footers, reaction prompts, and anything that is not an actionable code change. Output ONLY findings that require code edits. Format as markdown.
+
+$(cat "$RAW_REPORTS")" > "$PROMPT_FILE" 2>/dev/null || {
+        echo "[feature-review] Haiku collation failed; falling back to raw reports"
+        cat "$RAW_REPORTS" > "$PROMPT_FILE"
+    }
+    rm -f "$RAW_REPORTS"
+
+    # Append fix instructions
+    cat >> "$PROMPT_FILE" <<'FIXINST'
+
+## Instructions
+
+- Fix every blocker and major finding listed above with focused code edits
+- Add or update tests for each fix
+- After all fixes, run the project checks and make sure they pass:
+  - If package.json exists: run `npm run typecheck` then `npm test` (or `bun test` if bun.lock present)
+  - If go.mod exists: run `go vet ./...` then `go test ./...`
+  - If Makefile with test target: run `make test`
+  - Run any lint scripts available (`npm run lint`, etc.)
+- If a check fails, fix the failure before committing
+- Commit all fixes with a clear message
+- Do NOT refactor beyond what the findings require
+FIXINST
 
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
     CODEX_LOG=$(mktemp -t codex-fix-log.XXXXXX)
