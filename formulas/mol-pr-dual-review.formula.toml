@@ -34,13 +34,16 @@ Do not use a global `bd`, normal `gc bd`, Dolt commands, or `bd --db`.
 1. Caller slings with `--var pr=<url-or-number>` (and optional
    `--var integration_branch=<branch-name>`, `--var auto_fix=true`)
 2. Agent works through 6 sequential steps:
-   intake → dual-review → risk-capstone → verdict → file-fix-bead → complete
+   intake → dual-review → risk-capstone → verdict → codex-fix → complete
+   The codex-fix step runs `codex exec` directly to fix findings (no
+   separate bead filing). Codex must pass the project's checks before
+   committing.
 3. Reports written to
    `${GC_CITY_PATH}/.gc/pr-pipeline/reviews/pr-<N>/{codex.md,claude.md,risk.md,dual-review.md}`
 4. Root-bead notes record `verdict:`, `risk_class:`, and
    `report_path:` pointing at the combined index
 5. When `auto_fix=true` AND verdict is `request_changes`,
-   the `file-fix-bead` step synthesizes a fix bead and slings it to
+   the `codex-fix` step runs `codex exec` directly to fix findings on
    this rig's polecat pool. `fix_bead_id:` is recorded on root notes.
    Default is `auto_fix=false` (no auto-filing) for backward
    compatibility with callers like `mol-feature-review` that file
@@ -75,11 +78,11 @@ description = "Optional integration branch label, recorded in notes for callers 
 default = ""
 
 [vars.auto_fix]
-description = "When 'true' AND verdict is request_changes, the file-fix-bead step synthesizes a fix bead and slings it to this rig's polecat pool. Default 'false' so callers like mol-feature-review (which files its own rollup fix bead) don't get double-filing."
+description = "When 'true' AND verdict is request_changes, the codex-fix step runs codex exec directly to fix findings and commit. Default 'false' so callers like mol-feature-review (which files its own rollup fix) don't get double-fixing."
 default = "false"
 
 [vars.binding_prefix]
-description = "Pack binding prefix used for sling target naming (e.g. 'gastown-beads-lite.'). Only consulted by file-fix-bead."
+description = "Pack binding prefix (e.g. 'gastown-beads-lite.'). Used for witness/refinery target derivation."
 default = "gastown-beads-lite."
 
 [[steps]]
@@ -169,7 +172,7 @@ done
 ```
 
 Record initial state on the root bead. Also persist the PR's head and
-base refs from the captured metadata — `file-fix-bead` (step 5) reads
+base refs from the captured metadata — `codex-fix` (step 5) uses
 them to set the fix bead's `target` and `final_target` metadata.
 
 ```bash
@@ -937,15 +940,18 @@ recorded on root bead notes alongside finding counts.
 """
 
 [[steps]]
-id = "file-fix-bead"
-title = "(Optional) Synthesize a fix bead and sling it when changes are requested"
+id = "codex-fix"
+title = "(Optional) Run Codex to fix findings when changes are requested"
 needs = ["verdict"]
 description = """
 Conditional step: if `auto_fix=true` (caller opted in) AND the verdict
-is `request_changes`, synthesize a fix bead from the
-dual-review report and route it to this rig's polecat pool. The fix
-polecat reads the structured report files directly — the bead body
-just points to them and lists acceptance criteria.
+is `request_changes`, run `codex exec` directly against the repo to fix
+the review findings. Codex reads the structured reports, applies fixes,
+runs the project's checks (build/lint/test), and commits the result.
+
+This replaces the old polecat-based fix bead approach — Codex fixes are
+faster and produce cleaner results than re-routing through a Claude
+polecat.
 
 Skip silently when `auto_fix=false` (default) or when the verdict is
 `approve`. Callers like `mol-feature-review` that file their own
@@ -954,7 +960,7 @@ rollup fix bead must leave `auto_fix=false` to avoid double-filing.
 ```bash
 AUTO_FIX="{{auto_fix}}"
 if [ "$AUTO_FIX" != "true" ]; then
-    echo "[dual-review] auto_fix=$AUTO_FIX — skipping fix-bead synthesis"
+    echo "[dual-review] auto_fix=$AUTO_FIX — skipping codex fix"
     exit 0
 fi
 
@@ -981,7 +987,7 @@ VERDICT=$(echo "$NOTES" | grep '^verdict:' | tail -1 | sed 's/^verdict: //')
 case "$VERDICT" in
     request_changes) ;;
     *)
-        echo "[dual-review] verdict=$VERDICT — no fix bead needed"
+        echo "[dual-review] verdict=$VERDICT — no fix needed"
         exit 0
         ;;
 esac
@@ -994,89 +1000,120 @@ HEAD_REF=$(echo "$NOTES"   | grep '^head_ref:'    | tail -1 | sed 's/^head_ref: 
 BASE_REF=$(echo "$NOTES"   | grep '^base_ref:'    | tail -1 | sed 's/^base_ref: //')
 
 if [ -z "$HEAD_REF" ] || [ -z "$BASE_REF" ]; then
-    echo "[dual-review] WARN: missing head_ref or base_ref in root notes; skipping fix-bead" >&2
-    bd update "$ROOT_ID" --append-notes "fix_bead_id: (skipped: missing branch refs)"
+    echo "[dual-review] WARN: missing head_ref or base_ref in root notes; skipping codex fix" >&2
+    bd update "$ROOT_ID" --append-notes "codex_fix: skipped (missing branch refs)"
     exit 0
 fi
+```
 
-# Body intentionally brief — the fix polecat re-reads the report
-# files; do not duplicate findings inline (they could drift).
-FIX_BODY_FILE=$(mktemp -t fix-body.XXXXXX.md)
-cat > "$FIX_BODY_FILE" <<FIX_EOF
-The dual-review on PR #${PR_NUM} returned verdict \\`${VERDICT}\\` with
-risk_class=\\`${RISK_CLASS}\\`. Address every blocker and major finding
-with focused edits + tests on a polecat branch off \\`${HEAD_REF}\\`.
+### Build the Codex fix prompt from review reports
 
-## Reports to read
+Read the Claude and Codex review reports and compose a prompt that
+tells Codex exactly what to fix and requires passing checks.
 
-- Combined index: ${REPORT_DIR}/dual-review.md
-- Codex findings: ${REPORT_DIR}/codex.md
-- Claude findings: ${REPORT_DIR}/claude.md
-- Risk capstone:   ${REPORT_DIR}/risk.md
+```bash
+PROMPT_FILE=$(mktemp -t codex-fix-prompt.XXXXXX.md)
+{
+    echo "# Fix review findings for PR #${PR_NUM}"
+    echo ""
+    echo "You are fixing code review findings in this repository on branch \\`${HEAD_REF}\\`."
+    echo "Fix ALL of the following issues found by the dual code review."
+    echo ""
+    echo "## Claude findings"
+    echo ""
+    if [ -f "$REPORT_DIR/claude.md" ] && [ -s "$REPORT_DIR/claude.md" ]; then
+        cat "$REPORT_DIR/claude.md"
+    else
+        echo "(No Claude findings)"
+    fi
+    echo ""
+    echo "## Codex findings"
+    echo ""
+    if [ -f "$REPORT_DIR/codex.md" ] && [ -s "$REPORT_DIR/codex.md" ]; then
+        cat "$REPORT_DIR/codex.md"
+    else
+        echo "(No Codex findings)"
+    fi
+    echo ""
+    echo "## Risk capstone"
+    echo ""
+    if [ -f "$REPORT_DIR/risk.md" ] && [ -s "$REPORT_DIR/risk.md" ]; then
+        echo "Prioritize findings that the risk capstone flags as high-blast-radius:"
+        echo ""
+        cat "$REPORT_DIR/risk.md"
+    fi
+    echo ""
+    echo "## Instructions"
+    echo ""
+    echo "- Fix every blocker and major finding with focused code edits"
+    echo "- Add or update tests for each fix"
+    echo "- After making all fixes, run the project checks and make sure they pass:"
+    echo "  - If package.json exists: run \\`npm test\\` (or \\`bun test\\` if bun.lock is present)"
+    echo "  - If go.mod exists: run \\`go test ./...\\`"
+    echo "  - If Makefile with test target exists: run \\`make test\\`"
+    echo "  - Run any lint/typecheck scripts available (\\`npm run typecheck\\`, \\`npm run lint\\`, etc.)"
+    echo "- If a check fails, fix the failure before committing"
+    echo "- Commit all fixes with a clear message describing what was fixed"
+    echo "- Do NOT create new files unless a test file is genuinely needed"
+    echo "- Do NOT refactor code beyond what the findings require"
+} > "$PROMPT_FILE"
+```
 
-Read all four. The combined index links the rest; the per-reviewer
-files carry the structured findings with file:line evidence; the risk
-capstone marks which findings intersect high-blast-radius surfaces
-(prioritize those).
+### Run Codex exec
 
-## Acceptance
+Run `codex exec` against the repo. Use `gpt-5.3-codex` with high
+reasoning effort. The `unset CLAUDECODE` prevents Claude env from
+leaking into the codex process.
 
-- Every blocker and major finding addressed with a code edit + a test
-- New tests added for each finding; all existing tests still pass
-- Lint and typecheck clean (project-specific commands)
-- Commit messages reference the finding ("fix: <description> (codex N/M)")
-- Push the polecat branch and submit to refinery — do not merge
-  directly to \\`${HEAD_REF}\\` (refinery handles that)
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+CODEX_LOG=$(mktemp -t codex-fix-log.XXXXXX)
+CODEX_EXIT=0
 
-## References
+cd "$REPO_ROOT"
+(unset CLAUDECODE; codex exec \\
+    -m gpt-5.3-codex \\
+    --dangerously-bypass-approvals-and-sandbox \\
+    -c model_reasoning_effort=high \\
+    - < "$PROMPT_FILE" > "$CODEX_LOG" 2>&1) || CODEX_EXIT=$?
 
-- Source dual-review bead: ${ROOT_ID}
-- Verdict: ${VERDICT} (risk_class=${RISK_CLASS})
-- PR: #${PR_NUM} on ${REPO}
-FIX_EOF
+rm -f "$PROMPT_FILE"
 
-FIX_TITLE="Fix dual-review findings on PR #${PR_NUM} (${VERDICT})"
-FIX_METADATA=$(jq -nc \\
-    --arg target "$HEAD_REF" \\
-    --arg final_target "$BASE_REF" \\
-    --arg pr "$PR_NUM" \\
-    --arg feature_phase "fix" \\
-    --arg source_review "$ROOT_ID" \\
-    '{target:$target, final_target:$final_target, pr:$pr, feature_phase:$feature_phase, source_review:$source_review}')
-
-FIX_ID=$(bd create "$FIX_TITLE" \\
-    --body-file "$FIX_BODY_FILE" \\
-    --metadata "$FIX_METADATA" \\
-    --json 2>/dev/null | jq -r '.id // .[0].id // empty')
-rm -f "$FIX_BODY_FILE"
-
-if [ -z "$FIX_ID" ] || [ "$FIX_ID" = "null" ]; then
-    echo "[dual-review] WARN: bd create returned no id for fix bead" >&2
-    bd update "$ROOT_ID" --append-notes "fix_bead_id: (creation failed)"
+if [ "$CODEX_EXIT" -ne 0 ]; then
+    echo "[dual-review] WARN: codex exec failed (exit=$CODEX_EXIT)" >&2
+    bd update "$ROOT_ID" --append-notes "codex_fix: failed (exit=$CODEX_EXIT, log=$CODEX_LOG)"
     exit 0
 fi
+```
 
-# Graph hygiene — fix bead is blocked-by the review root.
-bd dep add "$FIX_ID" --blocked-by "$ROOT_ID" 2>/dev/null || true
+### Verify and commit
 
-# Sling to this rig's polecat pool. gc sling sets gc.routed_to and
-# creates an auto-convoy so the controller picks the bead up cleanly.
-SLING_TARGET="${GC_RIG:-}/{{binding_prefix}}polecat"
-if [ -z "$GC_RIG" ]; then
-    # Fall back to scraping rig from cwd if GC_RIG isn't set.
-    SLING_TARGET=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")/{{binding_prefix}}polecat
-fi
+Check if codex made changes. If it did, verify they're committed
+(codex usually auto-commits). If not committed, stage and commit.
 
-if gc sling "$SLING_TARGET" "$FIX_ID" >/tmp/dual-review-sling.log 2>&1; then
-    bd update "$ROOT_ID" --append-notes "fix_bead_id: $FIX_ID
-fix_bead_routed_to: $SLING_TARGET"
-    echo "[dual-review] auto-filed fix bead $FIX_ID → $SLING_TARGET"
+```bash
+if [ -z "$(git diff HEAD --name-only 2>/dev/null)" ] && [ -z "$(git diff --staged --name-only 2>/dev/null)" ]; then
+    LAST_MSG=$(git log -1 --format=%s 2>/dev/null || true)
+    if echo "$LAST_MSG" | grep -qiE "fix|address|review|finding"; then
+        echo "[dual-review] codex committed its changes: $LAST_MSG"
+    else
+        echo "[dual-review] WARN: codex made no changes" >&2
+        bd update "$ROOT_ID" --append-notes "codex_fix: no changes produced"
+        exit 0
+    fi
 else
-    echo "[dual-review] WARN: bd created $FIX_ID but gc sling to $SLING_TARGET failed (see /tmp/dual-review-sling.log)" >&2
-    # Still record the bead id — operator can re-sling manually.
-    bd update "$ROOT_ID" --append-notes "fix_bead_id: $FIX_ID
-fix_bead_routed_to: (sling failed)"
+    git add -A
+    git commit -m "fix: address dual-review findings via codex (PR #${PR_NUM})" || {
+        echo "[dual-review] WARN: codex changes failed to commit" >&2
+        bd update "$ROOT_ID" --append-notes "codex_fix: commit failed"
+        exit 0
+    }
 fi
+
+CODEX_SHA=$(git rev-parse HEAD)
+bd update "$ROOT_ID" --append-notes "codex_fix: applied at $CODEX_SHA
+codex_fix_log: $CODEX_LOG"
+echo "[dual-review] codex fix applied at $CODEX_SHA"
 ```
 
 **Exit criteria:** One of:
@@ -1093,7 +1130,7 @@ fi
 [[steps]]
 id = "complete"
 title = "Write combined index, post summary on PR, close the bead"
-needs = ["file-fix-bead"]
+needs = ["codex-fix"]
 description = """
 Write a combined index that links the three reports, post a summary
 comment on the PR so the verdict + risk class + report excerpts are
